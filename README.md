@@ -323,6 +323,16 @@ You find examples for the datasets used in the paper in the respective subfolder
   # will create folders BAG1 ... BAGN with the required data format
   ```
 
+  Split ROS 2 MCAP recordings with `cam0` ... `camN` and `imu` bag directories can
+  be converted directly to the required format. The default output size is 960x600:
+  ```bash
+  source /opt/ros/humble/setup.bash
+  python3 tools/mcap_vio_to_euroc.py /path/to/sequence /path/to/sequence_euroc
+  ```
+  Compressed JPEG/PNG images and continuous H.264 camera streams are supported.
+  This requires the ROS 2 MCAP storage plugin (for example,
+  `ros-humble-rosbag2-storage-mcap` on ROS 2 Humble).
+
   For fusion of GPS / global position measurements, the following formats are supported:
   * `cartesian`: file `[dataset_path]/gps0/data.csv`
   ```

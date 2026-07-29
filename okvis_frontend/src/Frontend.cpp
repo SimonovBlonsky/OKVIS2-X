@@ -1053,33 +1053,15 @@ bool Frontend::dataAssociationAndInitialization(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
-  default:
-    OKVIS_THROW(Exception, "Unsupported distortion type.")
-    break;
-  }
-
-
-  // remove outliers, as the last matching step may have introduced some:
-  switch (distortionType) {
-  case okvis::cameras::NCameraSystem::RadialTangential: {
-    removeOutliers<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
-      estimator, params.nCameraSystem, framesInOut);
-    break;
-  }
-  case okvis::cameras::NCameraSystem::Equidistant: {
-    removeOutliers<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
-      estimator, params.nCameraSystem, framesInOut);
-    break;
-  }
-  case okvis::cameras::NCameraSystem::RadialTangential8: {
-    removeOutliers<okvis::cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
+  case okvis::cameras::NCameraSystem::NoDistortion: {
+    removeOutliers<okvis::cameras::EucmCamera>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
   default:
     OKVIS_THROW(Exception, "Unsupported distortion type.")
     break;
-  } //ToDo:EUCM
+  }
 
 #ifdef OKVIS_USE_NN
   if(params.frontend.use_cnn) {
