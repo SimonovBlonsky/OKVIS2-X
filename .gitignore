@@ -8,3 +8,4 @@
 workspace
 **/__pycache__/
 state_checker/
+.worktrees/
