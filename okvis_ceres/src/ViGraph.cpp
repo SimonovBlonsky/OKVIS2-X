@@ -36,6 +36,131 @@
 /// \brief okvis Main namespace of this package.
 namespace okvis {
 
+void ViGraph::setDiagnosticsCollectionEnabled(const bool enabled) {
+  if (enabled) {
+    if (!diagnostics_) {
+      diagnostics_.reset(new DiagnosticsState());
+    }
+  } else {
+    diagnostics_.reset();
+  }
+}
+
+diagnostics::EventContext ViGraph::diagnosticsEventContext() const {
+  diagnostics::EventContext context;
+  if (!states_.empty()) {
+    const auto& newest = *states_.rbegin();
+    context.eventFrameId = newest.first.value();
+    context.eventTimestampNs = newest.second.timestamp.toNSec();
+  } else if (!anyState_.empty()) {
+    const auto& newest = *anyState_.rbegin();
+    context.eventFrameId = newest.first.value();
+    context.eventTimestampNs = newest.second.timestamp.toNSec();
+  }
+  return context;
+}
+
+void ViGraph::enqueueLandmarkEvent(
+    const LandmarkId landmarkId,
+    const diagnostics::LandmarkEventType eventType,
+    const diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context,
+    const std::optional<KeypointIdentifier> subject,
+    const bool initialisedBefore, const bool initialisedAfter,
+    const size_t observationsBefore, const size_t observationsAfter,
+    const std::optional<double> quality) {
+  if (!diagnostics_) {
+    return;
+  }
+  diagnostics::LandmarkEventRecord event;
+  event.eventTimestampNs = context.eventTimestampNs;
+  event.eventFrameId = context.eventFrameId;
+  event.landmarkId = landmarkId.value();
+  event.graphRole = diagnosticsGraphRole_;
+  event.eventType = eventType;
+  event.reason = reason;
+  event.initialisedBefore = initialisedBefore;
+  event.initialisedAfter = initialisedAfter;
+  event.observationsBefore = observationsBefore;
+  event.observationsAfter = observationsAfter;
+  event.quality = quality;
+  if (subject) {
+    event.subjectFrameId = subject->frameId;
+    const StateId subjectState(subject->frameId);
+    const auto state = states_.find(subjectState);
+    if (state != states_.end()) {
+      event.subjectTimestampNs = state->second.timestamp.toNSec();
+    } else {
+      const auto anyState = anyState_.find(subjectState);
+      if (anyState != anyState_.end()) {
+        event.subjectTimestampNs = anyState->second.timestamp.toNSec();
+      }
+    }
+  }
+  const auto birth = diagnostics_->births.find(landmarkId);
+  if (birth != diagnostics_->births.end()) {
+    event.birthTimestampNs = birth->second.timestampNs;
+    event.birthFrameId = birth->second.frameId;
+  }
+  diagnostics_->events.push_back(std::move(event));
+}
+
+void ViGraph::registerLandmarkBirth(
+    const LandmarkId landmarkId, const diagnostics::EventContext& context,
+    const bool emitEvent) {
+  if (!diagnostics_) {
+    return;
+  }
+  const auto inserted = diagnostics_->births.emplace(
+      landmarkId,
+      LandmarkBirthContext{context.eventTimestampNs, context.eventFrameId});
+  if (!inserted.second || !emitEvent) {
+    return;
+  }
+  bool initialised = false;
+  double quality = 0.0;
+  size_t observations = 0;
+  const auto landmark = landmarks_.find(landmarkId);
+  if (landmark != landmarks_.end()) {
+    initialised = landmark->second.hPoint->initialized();
+    quality = landmark->second.quality;
+    observations = landmark->second.observations.size();
+  }
+  enqueueLandmarkEvent(
+      landmarkId, diagnostics::LandmarkEventType::Birth,
+      diagnostics::RemovalReason::Unknown, context, std::nullopt, false,
+      initialised, 0, observations, quality);
+}
+
+void ViGraph::recordObservationAdded(
+    const LandmarkId landmarkId, const KeypointIdentifier keypointId,
+    const diagnostics::EventContext& context) {
+  if (!diagnostics_) {
+    return;
+  }
+  const auto landmark = landmarks_.find(landmarkId);
+  if (landmark == landmarks_.end()) {
+    return;
+  }
+  const size_t after = landmark->second.observations.size();
+  enqueueLandmarkEvent(
+      landmarkId, diagnostics::LandmarkEventType::ObservationAdded,
+      diagnostics::RemovalReason::Unknown, context, keypointId,
+      landmark->second.hPoint->initialized(),
+      landmark->second.hPoint->initialized(), after > 0 ? after - 1 : 0,
+      after, landmark->second.quality);
+}
+
+std::vector<diagnostics::LandmarkEventRecord>
+ViGraph::takeDiagnosticEvents() {
+  if (!diagnostics_) {
+    return {};
+  }
+  std::vector<diagnostics::LandmarkEventRecord> events;
+  events.swap(diagnostics_->events);
+  return events;
+}
+
 struct FourDoFResidual {
   FourDoFResidual(const Eigen::Vector3d& point_G, const Eigen::Vector3d& point_W)
       : pG_(point_G), pW_(point_W) {}
@@ -618,8 +743,19 @@ LandmarkId ViGraph::addLandmark(const Eigen::Vector4d &homogeneousPoint, bool in
 
 bool ViGraph::removeLandmark(LandmarkId landmarkId)
 {
+  return removeLandmark(landmarkId, diagnostics::RemovalReason::Unknown,
+                        diagnosticsEventContext());
+}
+
+bool ViGraph::removeLandmark(
+    LandmarkId landmarkId, diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context)
+{
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId), "landmark does not exists")
   Landmark& landmark = landmarks_.at(landmarkId);
+  const bool initialised = landmark.hPoint->initialized();
+  const double quality = landmark.quality;
+  const size_t observationsBefore = landmark.observations.size();
 
   // remove all observations
   for(auto observation : landmark.observations) {
@@ -636,13 +772,36 @@ bool ViGraph::removeLandmark(LandmarkId landmarkId)
   // now remove the landmark itself
   problem_->RemoveParameterBlock(landmark.hPoint->parameters());
   landmarks_.erase(landmarkId);
+  const auto eventType =
+      reason == diagnostics::RemovalReason::ExplicitLandmarkMerge
+          ? diagnostics::LandmarkEventType::LandmarkMerged
+          : diagnostics::LandmarkEventType::LandmarkRemoved;
+  enqueueLandmarkEvent(
+      landmarkId, eventType, reason,
+      context, std::nullopt, initialised, false, observationsBefore, 0,
+      quality);
+  if (diagnostics_) {
+    diagnostics_->births.erase(landmarkId);
+  }
   return true;
 }
 
 bool ViGraph::setLandmarkInitialised(LandmarkId landmarkId, bool initialised)
 {
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(landmarkId), "landmark does not exists")
-  landmarks_.at(landmarkId).hPoint->setInitialized(initialised);
+  Landmark& landmark = landmarks_.at(landmarkId);
+  const bool initialisedBefore = landmark.hPoint->initialized();
+  landmark.hPoint->setInitialized(initialised);
+  if (initialisedBefore != initialised) {
+    enqueueLandmarkEvent(
+        landmarkId,
+        initialised ? diagnostics::LandmarkEventType::Initialised
+                    : diagnostics::LandmarkEventType::Deinitialised,
+        diagnostics::RemovalReason::Unknown, diagnosticsEventContext(),
+        std::nullopt, initialisedBefore, initialised,
+        landmark.observations.size(), landmark.observations.size(),
+        landmark.quality);
+  }
   return true;
 }
 
@@ -693,6 +852,14 @@ void ViGraph::checkObservations() const {
 
 bool ViGraph::removeObservation(KeypointIdentifier keypointId)
 {
+  return removeObservation(keypointId, diagnostics::RemovalReason::Unknown,
+                           diagnosticsEventContext());
+}
+
+bool ViGraph::removeObservation(
+    KeypointIdentifier keypointId, diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context)
+{
   OKVIS_ASSERT_TRUE_DBG(Exception, observations_.count(keypointId), "observation does not exists")
   Observation observation = observations_.at(keypointId);
 
@@ -706,6 +873,9 @@ bool ViGraph::removeObservation(KeypointIdentifier keypointId)
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(observation.landmarkId),
                         "landmark does not exists")
   Landmark& landmark = landmarks_.at(observation.landmarkId);
+  const bool initialised = landmark.hPoint->initialized();
+  const double quality = landmark.quality;
+  const size_t observationsBefore = landmark.observations.size();
   OKVIS_ASSERT_TRUE_DBG(Exception, landmark.observations.count(keypointId),
                     "observation does not exists")
   landmark.observations.erase(keypointId);
@@ -717,6 +887,12 @@ bool ViGraph::removeObservation(KeypointIdentifier keypointId)
                     "observation does not exists")
   state.observations.erase(keypointId);
   observations_.erase(keypointId);
+
+  enqueueLandmarkEvent(
+      observation.landmarkId,
+      diagnostics::LandmarkEventType::ObservationRemoved, reason, context,
+      keypointId, initialised, initialised, observationsBefore,
+      landmark.observations.size(), quality);
 
   // covisibilities invalid
   covisibilitiesComputed_ = false;
@@ -1605,9 +1781,20 @@ bool ViGraph::landmarkExists(LandmarkId landmarkId) const
 bool ViGraph::setLandmark(LandmarkId id, const Eigen::Vector4d &homogeneousPoint, bool initialised)
 {
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(id), "landmark does not exists")
-  auto& landmark = landmarks_.at(id).hPoint;
-  landmark->setEstimate(homogeneousPoint);
-  landmark->setInitialized(initialised);
+  auto& landmark = landmarks_.at(id);
+  const bool initialisedBefore = landmark.hPoint->initialized();
+  landmark.hPoint->setEstimate(homogeneousPoint);
+  landmark.hPoint->setInitialized(initialised);
+  if (initialisedBefore != initialised) {
+    enqueueLandmarkEvent(
+        id,
+        initialised ? diagnostics::LandmarkEventType::Initialised
+                    : diagnostics::LandmarkEventType::Deinitialised,
+        diagnostics::RemovalReason::Unknown, diagnosticsEventContext(),
+        std::nullopt, initialisedBefore, initialised,
+        landmark.observations.size(), landmark.observations.size(),
+        landmark.quality);
+  }
   return true;
 }
 bool ViGraph::setLandmark(LandmarkId id, const Eigen::Vector4d &homogeneousPoint)
@@ -1835,8 +2022,19 @@ void ViGraph::updateLandmarks()
       }
     }
     // update initialisation
+    const bool initialisedBefore = it->second.hPoint->initialized();
     it->second.hPoint->setInitialized(isInitialised);
     it->second.quality = quality;
+    if (initialisedBefore != isInitialised) {
+      enqueueLandmarkEvent(
+          it->first,
+          isInitialised ? diagnostics::LandmarkEventType::Initialised
+                        : diagnostics::LandmarkEventType::Deinitialised,
+          diagnostics::RemovalReason::Unknown, diagnosticsEventContext(),
+          std::nullopt, initialisedBefore, isInitialised,
+          it->second.observations.size(), it->second.observations.size(),
+          quality);
+    }
   }
 }
 
@@ -1913,21 +2111,37 @@ bool ViGraph::setOptimisationTimeLimit(double timeLimit, int minIterations)
 
 int ViGraph::cleanUnobservedLandmarks(std::map<LandmarkId, std::set<KeypointIdentifier> > *removed)
 {
+  return cleanUnobservedLandmarks(
+      removed, diagnostics::RemovalReason::Unknown,
+      diagnosticsEventContext());
+}
+
+int ViGraph::cleanUnobservedLandmarks(
+    std::map<LandmarkId, std::set<KeypointIdentifier>>* removed,
+    diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context)
+{
   int ctr = 0;
   for (auto it = landmarks_.begin(); it != landmarks_.end(); ) {
     const auto& lm = it->second;
     if(lm.observations.size()<=1) {
+      const LandmarkId landmarkId = it->first;
+      std::vector<KeypointIdentifier> observations;
+      observations.reserve(lm.observations.size());
+      for (const auto& observation : lm.observations) {
+        observations.push_back(observation.first);
+      }
       if(removed) {
-        (*removed)[it->first] = std::set<KeypointIdentifier>();
+        (*removed)[landmarkId] = std::set<KeypointIdentifier>();
       }
-      if(lm.observations.size()==1) {
+      if(observations.size()==1) {
         if(removed) {
-          removed->at(it->first).insert(lm.observations.begin()->first);
+          removed->at(landmarkId).insert(observations.front());
         }
-        removeObservation(lm.observations.begin()->first);
+        removeObservation(observations.front(), reason, context);
       }
-      problem_->RemoveParameterBlock(lm.hPoint->parameters());
-      it = landmarks_.erase(it);
+      ++it;
+      removeLandmark(landmarkId, reason, context);
       ctr++;
     }
     else {

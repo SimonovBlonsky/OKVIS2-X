@@ -200,6 +200,9 @@ class ThreadedSlam : public ViInterface {
   /// \brief Stops all threading.
   void stopThreading();
 
+  /// \brief Stops processing and flushes all queued diagnostics.
+  void flushDiagnostics();
+
   /// \brief Writes the final trajectory CSV file.
   void writeFinalTrajectoryCsv();
 

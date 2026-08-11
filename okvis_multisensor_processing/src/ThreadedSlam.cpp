@@ -1448,6 +1448,11 @@ void ThreadedSlam::stopThreading() {
   }
 }
 
+void ThreadedSlam::flushDiagnostics() {
+  stopThreading();
+  estimator_.flushDiagnostics();
+}
+
 void ThreadedSlam::writeFinalTrajectoryCsv()
 {
   // thread safety -- join running stuff

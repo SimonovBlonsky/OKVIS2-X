@@ -25,9 +25,11 @@ add_library(${LIB_NAME}
   include/opengv/sac_problems/absolute_pose/FrameAbsolutePoseSacProblem.hpp
   include/opengv/sac_problems/relative_pose/FrameRelativePoseSacProblem.hpp
   include/opengv/sac_problems/relative_pose/FrameRotationOnlySacProblem.hpp
+  include/okvis/FrontendDiagnostics.hpp
   src/FBrisk.cpp
   src/FrameNoncentralAbsoluteAdapter.cpp
   src/FrameRelativeAdapter.cpp
+  src/FrontendDiagnostics.cpp
   src/Frontend.cpp
   src/LoopclosureNoncentralAbsoluteAdapter.cpp
   src/stereo_triangulation.cpp
@@ -92,3 +94,22 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+
+if(BUILD_TESTS)
+  set(TEST_NAME okvis_frontend_test)
+  add_executable(${TEST_NAME}
+    test/TestFrontendDiagnostics.cpp
+    test/test_main.cpp
+  )
+  target_link_libraries(${TEST_NAME}
+    ${LIB_NAME}
+    ${GLOG_LIBRARIES}
+    gtest
+    ${OpenCV_LIBS}
+  )
+  target_compile_options(${TEST_NAME}
+    PUBLIC ${OKVIS_PUBLIC_CXX_FLAGS}
+    PRIVATE ${OKVIS_PRIVATE_CXX_FLAGS}
+  )
+  add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+endif()

@@ -27,10 +27,19 @@ namespace okvis {
 
 bool ViGraphEstimator::removeAllObservations(StateId stateId)
 {
+  return removeAllObservations(
+      stateId, diagnostics::RemovalReason::Unknown,
+      diagnosticsEventContext());
+}
+
+bool ViGraphEstimator::removeAllObservations(
+    StateId stateId, diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context)
+{
   OKVIS_ASSERT_TRUE_DBG(Exception, states_.count(stateId), "State ID not found")
   std::map<KeypointIdentifier, Observation> observations = states_.at(stateId).observations;
   for(auto observation : observations) {
-    removeObservation(observation.first);
+    removeObservation(observation.first, reason, context);
   }
   return true;
 }
@@ -173,6 +182,17 @@ bool ViGraphEstimator::eliminateStateByImuMerge(StateId stateId, StateId refId)
 bool ViGraphEstimator::mergeLandmark(LandmarkId fromId, LandmarkId intoId,
                                      std::map<StateId, MultiFramePtr> &multiFrames)
 {
+  return mergeLandmark(
+      fromId, intoId, multiFrames,
+      diagnostics::RemovalReason::Unknown, diagnosticsEventContext());
+}
+
+bool ViGraphEstimator::mergeLandmark(
+    LandmarkId fromId, LandmarkId intoId,
+    std::map<StateId, MultiFramePtr>& multiFrames,
+    diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context)
+{
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(fromId), "Landmark ID not found")
   OKVIS_ASSERT_TRUE_DBG(Exception, landmarks_.count(intoId), "Landmark ID not found")
 
@@ -186,7 +206,7 @@ bool ViGraphEstimator::mergeLandmark(LandmarkId fromId, LandmarkId intoId,
     }
 
     // now remove
-    removeObservation(observation.first);
+    removeObservation(observation.first, reason, context);
 
     // add again
     State & state = states_.at(StateId(observation.first.frameId));
@@ -207,7 +227,7 @@ bool ViGraphEstimator::mergeLandmark(LandmarkId fromId, LandmarkId intoId,
 
   // also actually remove landmark
   OKVIS_ASSERT_TRUE_DBG(Exception, fromLandmark.observations.size() == 0, "observations present")
-  removeLandmark(fromId);
+  removeLandmark(fromId, reason, context);
   //checkObservations();
 
   return true;
@@ -337,6 +357,21 @@ bool ViGraphEstimator::convertToPoseGraphMst(
     std::vector<PoseGraphEdge> * createdPoseGraphEdges,
     std::vector<std::pair<StateId,StateId>> * removedTwoPoseErrors,
     std::vector<KeypointIdentifier> * removedObservations)
+{
+  return convertToPoseGraphMst(
+      states, statesToConsider, createdPoseGraphEdges, removedTwoPoseErrors,
+      removedObservations, diagnostics::RemovalReason::Unknown,
+      diagnosticsEventContext());
+}
+
+bool ViGraphEstimator::convertToPoseGraphMst(
+    const std::set<StateId>& states,
+    const std::set<StateId>& statesToConsider,
+    std::vector<PoseGraphEdge>* createdPoseGraphEdges,
+    std::vector<std::pair<StateId, StateId>>* removedTwoPoseErrors,
+    std::vector<KeypointIdentifier>* removedObservations,
+    diagnostics::RemovalReason reason,
+    const diagnostics::EventContext& context)
 {
   // first build the MST
   buildMst(statesToConsider);
@@ -506,7 +541,7 @@ bool ViGraphEstimator::convertToPoseGraphMst(
       // check if observation needs to be considered
       if(landmarksConsidered.count(observation.second.landmarkId.value())==0) {
         if(!keepReferenceState) {
-          removeObservation(observation.first);
+          removeObservation(observation.first, reason, context);
           removedObservations->push_back(observation.first);
         }
         continue;
@@ -523,7 +558,7 @@ bool ViGraphEstimator::convertToPoseGraphMst(
             referenceState.extrinsics.at(observation.first.cameraIndex), keepReferenceState);
       if(!keepReferenceState) {
         // we remove the observation completely
-        removeObservation(observation.first);
+        removeObservation(observation.first, reason, context);
         removedObservations->push_back(observation.first);
       }
     }
@@ -532,7 +567,7 @@ bool ViGraphEstimator::convertToPoseGraphMst(
       // check if observation needs to be considered
       if(landmarksConsidered.count(observation.second.landmarkId.value())==0) {
         if(!keepOtherState) {
-          removeObservation(observation.first);
+          removeObservation(observation.first, reason, context);
           removedObservations->push_back(observation.first);
         }
         continue;
@@ -549,7 +584,7 @@ bool ViGraphEstimator::convertToPoseGraphMst(
             otherState.extrinsics.at(observation.first.cameraIndex), keepOtherState);
       if(!keepOtherState) {
         // we remove the observation completely
-        removeObservation(observation.first);
+        removeObservation(observation.first, reason, context);
         removedObservations->push_back(observation.first);
       }
     }
@@ -1299,4 +1334,3 @@ bool ViGraphEstimator::isSynched(const ViGraphEstimator & other) const
 }
 
 }  // namespace okvis
-

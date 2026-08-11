@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <limits>
 #include <thread>
 
 #include <brisk/brisk.h>
@@ -84,6 +85,34 @@
 /// \brief okvis Main namespace of this package.
 namespace okvis {
 
+namespace {
+
+diagnostics::PoseSnapshot toDiagnosticPose(
+    const kinematics::Transformation& transformation) {
+  diagnostics::PoseSnapshot pose;
+  pose.tx = transformation.r().x();
+  pose.ty = transformation.r().y();
+  pose.tz = transformation.r().z();
+  pose.qw = transformation.q().w();
+  pose.qx = transformation.q().x();
+  pose.qy = transformation.q().y();
+  pose.qz = transformation.q().z();
+  return pose;
+}
+
+kinematics::Transformation fromDiagnosticPose(
+    const diagnostics::PoseSnapshot& pose) {
+  return kinematics::Transformation(
+      Eigen::Vector3d(pose.tx, pose.ty, pose.tz),
+      Eigen::Quaterniond(pose.qw, pose.qx, pose.qy, pose.qz));
+}
+
+uint32_t triggerBit(const diagnostics::RansacTrigger trigger) {
+  return static_cast<uint32_t>(trigger);
+}
+
+}  // namespace
+
 static const double kptrad = 0.09;
 //cv::Ptr<cv::CLAHE> mClahe;
 
@@ -134,6 +163,14 @@ Frontend::Frontend(size_t numCameras, std::string dBowVocDir)
   }
   trackingLost_ = false;
   initialiseBriskFeatureDetectors();
+
+  diagnostics::VioDiagnostics& diagnosticsWriter =
+      diagnostics::VioDiagnostics::instance();
+  if (diagnosticsWriter.configure(numCameras_)) {
+    diagnosticFrames_.reset(
+        new diagnostics::FrontendDiagnosticFrames(numCameras_));
+    diagnosticsWriter.writeMetadata("exposure_time_available", "false");
+  }
 
 #ifdef OKVIS_USE_NN
   // Deserialize the ScriptModule from a file using torch::jit::load().
@@ -251,6 +288,25 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
 
   // precompute backprojections
   frameOut->computeBackProjections(cameraIndex);
+
+  if (diagnosticFrames_) {
+    std::vector<cv::KeyPoint> detectedKeypoints;
+    detectedKeypoints.reserve(frameOut->numKeypoints(cameraIndex));
+    for (size_t keypointIndex = 0;
+         keypointIndex < frameOut->numKeypoints(cameraIndex);
+         ++keypointIndex) {
+      cv::KeyPoint keypoint;
+      if (frameOut->getCvKeypoint(cameraIndex, keypointIndex, keypoint)) {
+        detectedKeypoints.push_back(keypoint);
+      }
+    }
+    const diagnostics::CameraDetectionAccumulator detection =
+        diagnostics::summarizeKeypoints(
+            detectedKeypoints, frameOut->image(cameraIndex).cols,
+            frameOut->image(cameraIndex).rows);
+    diagnosticFrames_->updateDetection(frameOut->timestamp().toNSec(),
+                                       cameraIndex, detection);
+  }
 
   return true;
 }
@@ -541,6 +597,21 @@ bool Frontend::verifyRecognisedPlace(const Estimator &estimator,
                                        extrinsics[camIdx]->parameters());
           break;
         }
+        case okvis::cameras::NCameraSystem::NoDistortion: {
+          std::shared_ptr<ceres::ReprojectionError<cameras::EucmCamera>> reprojectionError(
+            new ceres::ReprojectionError<cameras::EucmCamera>(
+              framesInOut->geometryAs<cameras::EucmCamera>(camIdx),
+              camIdx,
+              kp,
+              64.0 / (size * size) * Eigen::Matrix2d::Identity()));
+          reprojectionErrors.push_back(reprojectionError);
+          quickSolver.AddResidualBlock(reprojectionError.get(),
+                                       &cauchyLoss,
+                                       pose->parameters(),
+                                       landmark->parameters(),
+                                       extrinsics[camIdx]->parameters());
+          break;
+        }
         default:
           OKVIS_THROW(Exception, "Unsupported distortion type.")
           break;
@@ -673,7 +744,15 @@ int Frontend::getFilteredDBoWResult(const std::unique_ptr<DBoW> &dBow,
 // Matching as well as initialization of landmarks and state.
 bool Frontend::dataAssociationAndInitialization(
     Estimator &estimator, const okvis::ViParameters& params,
-    std::shared_ptr<okvis::MultiFrame> framesInOut, bool kfPrior, bool* asKeyframe) {
+      std::shared_ptr<okvis::MultiFrame> framesInOut, bool kfPrior, bool* asKeyframe) {
+
+  std::shared_ptr<diagnostics::FrontendFrameAccumulator> diagnosticFrame;
+  if (diagnosticFrames_) {
+    diagnosticFrame = diagnosticFrames_->bindFrame(
+        framesInOut->id(), framesInOut->timestamp().toNSec());
+    diagnosticFrame->dataAssociationStartPose =
+        toDiagnosticPose(estimator.pose(StateId(framesInOut->id())));
+  }
 
   // match new keypoints to existing landmarks/keypoints
   // initialise new landmarks (states)
@@ -689,6 +768,7 @@ bool Frontend::dataAssociationAndInitialization(
                       "mixed frame types are not supported yet")
   }
   int num3dMatches = 0;
+  int motionStereoMatches = 0;
 
   // first frame? (did do addStates before, so 1 frame minimum in estimator)
   double trackingQuality = 1.0;
@@ -743,22 +823,26 @@ bool Frontend::dataAssociationAndInitialization(
       TimerSwitchable matchMotionStereoTimer("2.02 match motion stereo");
       switch (distortionType) {
         case okvis::cameras::NCameraSystem::RadialTangential: {
-          matchMotionStereo<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
+          motionStereoMatches =
+              matchMotionStereo<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
               estimator, params, framesInOut->id(), rotationOnly);
           break;
         }
         case okvis::cameras::NCameraSystem::Equidistant: {
-          matchMotionStereo<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
+          motionStereoMatches =
+              matchMotionStereo<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
               estimator, params, framesInOut->id(), rotationOnly);
           break;
         }
         case okvis::cameras::NCameraSystem::RadialTangential8: {
-          matchMotionStereo<cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
+          motionStereoMatches =
+              matchMotionStereo<cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
               estimator, params, framesInOut->id(), rotationOnly);
           break;
         }
         case okvis::cameras::NCameraSystem::NoDistortion: {
-          matchMotionStereo<cameras::EucmCamera>(estimator, params, framesInOut->id(), rotationOnly);
+          motionStereoMatches = matchMotionStereo<cameras::EucmCamera>(
+              estimator, params, framesInOut->id(), rotationOnly);
           break;
         }
         default:
@@ -1108,6 +1192,106 @@ bool Frontend::dataAssociationAndInitialization(
 #endif
   estimator.cleanUnobservedLandmarks();
 
+  if (diagnosticFrames_) {
+    auto completed = diagnosticFrames_->take(framesInOut->id());
+    if (!completed) {
+      diagnosticFrames_->bindFrame(framesInOut->id(),
+                                   framesInOut->timestamp().toNSec());
+      completed = diagnosticFrames_->take(framesInOut->id());
+    }
+    if (completed) {
+      diagnostics::FrameDiagnosticRecord& record = completed->record;
+      record.timestampNs = completed->timestampNs;
+      record.frameId = completed->frameId;
+      record.initialised = isInitialized_;
+      record.dataAssociationSucceeded = trackingQuality >= 0.01;
+      record.trackingQualityBelowThreshold = trackingQuality < 0.01;
+      record.keyframe = *asKeyframe;
+      record.trackingQuality = trackingQuality;
+      record.motionStereoMatches =
+          static_cast<size_t>(std::max(0, motionStereoMatches));
+      record.keypointCount.resize(numCameras_);
+      record.keypointResponse.resize(numCameras_);
+      record.occupiedGridFraction.resize(numCameras_);
+      record.convexHullFraction.resize(numCameras_);
+      record.projectedEligibleMapLandmarks.resize(numCameras_);
+      record.mapDescriptorComparisons.resize(numCameras_);
+      record.mapDescriptorCandidatesBelowThreshold.resize(numCameras_);
+      record.mapEpipolarRejected.resize(numCameras_);
+      record.mapDivergentRayRejected.resize(numCameras_);
+      record.acceptedInitialisedMapMatches.resize(numCameras_);
+      record.acceptedUninitialisedMapMatches.resize(numCameras_);
+      record.bestMapDescriptorDistance.resize(numCameras_);
+      for (size_t camera = 0; camera < numCameras_; ++camera) {
+        const auto& detection = completed->cameras.at(camera);
+        const auto& matching = completed->mapMatching.at(camera);
+        record.keypointCount[camera] = detection.keypoints;
+        record.keypointResponse[camera] = detection.response.summary();
+        record.occupiedGridFraction[camera] =
+            detection.occupiedGridFraction;
+        record.convexHullFraction[camera] = detection.convexHullFraction;
+        record.projectedEligibleMapLandmarks[camera] =
+            matching.projectedEligible;
+        record.mapDescriptorComparisons[camera] =
+            matching.descriptorComparisons;
+        record.mapDescriptorCandidatesBelowThreshold[camera] =
+            matching.descriptorCandidatesBelowThreshold;
+        record.mapEpipolarRejected[camera] = matching.epipolarRejected;
+        record.mapDivergentRayRejected[camera] =
+            matching.divergentRayRejected;
+        record.acceptedInitialisedMapMatches[camera] =
+            matching.acceptedInitialised;
+        record.acceptedUninitialisedMapMatches[camera] =
+            matching.acceptedUninitialised;
+        record.bestMapDescriptorDistance[camera] =
+            matching.bestDescriptorDistance.summary();
+        completed->descriptorDistance.merge(
+            matching.acceptedDescriptorDistance);
+        completed->predictedReprojectionErrorPx.merge(
+            matching.predictedReprojectionErrorPx);
+      }
+      record.acceptedDescriptorDistance =
+          completed->descriptorDistance.summary();
+      record.predictedReprojectionErrorPx =
+          completed->predictedReprojectionErrorPx.summary();
+
+      MapPoints pointMap;
+      estimator.getLandmarks(pointMap);
+      for (const auto& landmark : pointMap) {
+        if (landmark.second.isInitialised) {
+          ++record.activeInitialisedLandmarks;
+        } else {
+          ++record.activeUninitialisedLandmarks;
+        }
+      }
+
+      diagnostics::VioDiagnostics& writer =
+          diagnostics::VioDiagnostics::instance();
+      for (const auto& triangulation : completed->triangulation) {
+        writer.writeTriangulation(triangulation.second.toRecord(
+            completed->timestampNs, completed->frameId));
+      }
+      for (const auto& initialisation : completed->initialisation) {
+        writer.writeInitialisation(initialisation);
+      }
+      for (const auto& ransac : completed->ransac) {
+        writer.writeRansac(ransac);
+      }
+      auto landmarkEvents = estimator.takeLandmarkDiagnosticEvents(
+          diagnostics::GraphRole::Realtime);
+      for (const auto& event : landmarkEvents) {
+        if (event.eventType == diagnostics::LandmarkEventType::Birth) {
+          ++record.landmarkBirths;
+        } else if (event.eventType ==
+                   diagnostics::LandmarkEventType::Initialised) {
+          ++record.landmarkInitialisations;
+        }
+      }
+      writer.writeLandmarkEvents(std::move(landmarkEvents));
+      writer.writeFrame(record);
+    }
+  }
+
   return trackingQuality >= 0.01;
 }
 
@@ -1149,6 +1333,9 @@ void Frontend::clear()
   dBow_->database.clear();
   dBow_->poseIds.clear(); // Store the multiframe IDs corresponsind to the dBow ones
   trackingLost_ = false; // Is the tracking currently lost?
+  if (diagnosticFrames_) {
+    diagnosticFrames_->clear();
+  }
 }
 
 // Decision whether a new frame should be keyframe or not.
@@ -1274,6 +1461,13 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     return 0;
   }
 
+  std::shared_ptr<diagnostics::FrontendFrameAccumulator> diagnosticFrame;
+  if (diagnosticFrames_) {
+    const MultiFramePtr frame = estimator.multiFrame(StateId(currentFrameId));
+    diagnosticFrame = diagnosticFrames_->bindFrame(
+        currentFrameId, frame->timestamp().toNSec());
+  }
+
   // get all landmarks
   MapPoints pointMap;
   estimator.getLandmarks(pointMap);
@@ -1289,8 +1483,13 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   int ctr = 0;
   std::vector<cv::Mat> descriptorPool(params.nCameraSystem.numCameras());
   kinematics::Transformation T_WS1 = estimator.pose(StateId(currentFrameId));
+  const kinematics::Transformation dataAssociationStartPose =
+      diagnosticFrame
+          ? fromDiagnosticPose(diagnosticFrame->dataAssociationStartPose)
+          : T_WS1;
   double reprErr = 0.0;
   for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
+    size_t projectedEligible = 0;
 
     // the current frame to match
     const MultiFramePtr multiFrame = estimator.multiFrame(StateId(currentFrameId));
@@ -1359,6 +1558,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         continue;
 
       landmarkToMatch.projection = kp;
+      ++projectedEligible;
 
       // distinguish whether to consider as 3D point or not.
       const double quality = it->second.quality;
@@ -1369,6 +1569,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
           int(numDescriptorsToKeep), 48, CV_8UC1, dataPtr);
       landmarkToMatch.e_W.resize(3,numDescriptorsToKeep);
       landmarkToMatch.r_W.resize(3,numDescriptorsToKeep);
+      landmarkToMatch.keypoints.resize(2, numDescriptorsToKeep);
       landmarkToMatch.kids.reserve(numDescriptorsToKeep);
       const LandmarkId landmarkId = it->first;
       size_t o=0;
@@ -1434,6 +1635,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
           oldFrame->getBackProjection(kid.cameraIndex, kid.keypointIndex, e_C);
           landmarkToMatch.e_W.col(worstIdx) = T_WC_old.C()*e_C.normalized();
           landmarkToMatch.r_W.col(worstIdx) = T_WC_old.r();
+          Eigen::Vector2d oldKeypoint;
+          oldFrame->getKeypoint(kid.cameraIndex, kid.keypointIndex,
+                                oldKeypoint);
+          landmarkToMatch.keypoints.col(worstIdx) = oldKeypoint;
           landmarkToMatch.kids.push_back(kid);
 
           // remember which were used
@@ -1446,6 +1651,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       landmarkToMatch.descriptors = landmarkToMatch.descriptors(cv::Rect(0, 0, 48, o + 1));
       landmarkToMatch.e_W.conservativeResize(3,o + 1);
       landmarkToMatch.r_W.conservativeResize(3,o + 1);
+      landmarkToMatch.keypoints.conservativeResize(2, o + 1);
       dataPtr += (o + 1)*48;
 
       if(landmarkToMatch.descriptors.rows==0) {
@@ -1471,6 +1677,13 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
     std::vector<size_t> ctrs(num_matching_threads);
     std::vector<double> reprErrors(num_matching_threads);
+    std::vector<diagnostics::CameraMapMatchAccumulator> threadDiagnostics;
+    std::vector<double> matchedReprojectionErrors;
+    if (diagnosticFrame && !loopClosureLandmarksToUseExclusively) {
+      threadDiagnostics.resize(num_matching_threads);
+      matchedReprojectionErrors.resize(
+          numKeypoints, std::numeric_limits<double>::quiet_NaN());
+    }
 
     std::vector<std::thread*> threads(num_matching_threads, nullptr);
     for(size_t t = 0; t<num_matching_threads; ++t) {
@@ -1480,13 +1693,25 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
               loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
               std::cref(landmarksToMatch), numKeypoints,
               std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
-              std::ref(lmIds), std::ref(hps_W), std::ref(ctrs), std::ref(reprErrors));
+              std::ref(lmIds), std::ref(hps_W), std::ref(ctrs),
+              std::ref(reprErrors),
+              threadDiagnostics.empty() ? nullptr : &threadDiagnostics[t],
+              matchedReprojectionErrors.empty()
+                  ? nullptr
+                  : &matchedReprojectionErrors);
     }
 
     for(size_t t = 0; t<num_matching_threads; ++t) {
       threads[t]->join();
       delete threads[t];
       reprErr += reprErrors[t];
+    }
+    if (diagnosticFrame && !loopClosureLandmarksToUseExclusively) {
+      auto& cameraDiagnostics = diagnosticFrame->mapMatching.at(im);
+      cameraDiagnostics.projectedEligible += projectedEligible;
+      for (const auto& threadDiagnostic : threadDiagnostics) {
+        cameraDiagnostics.merge(threadDiagnostic);
+      }
     }
 
     // now insert observations
@@ -1496,14 +1721,32 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
         if(previousId && loopClosureLandmarksToUseExclusively) {
           // remove
-          estimator.removeObservation(StateId(currentFrameId), im, k);
+          if (diagnosticFrame) {
+            ++diagnosticFrame->record.observationsRemovedByReason.at(
+                static_cast<size_t>(
+                    diagnostics::RemovalReason::LoopClosureReassociation));
+          }
+          estimator.removeObservation(
+              StateId(currentFrameId), im, k,
+              diagnostics::RemovalReason::LoopClosureReassociation);
           oldIds.push_back(LandmarkId(previousId));
           newIds.push_back(lmIds[k]);
         }
 
         multiFrame->setLandmarkId(im, k, lmIds[k].value());
-        estimator.addObservation<CAMERA_GEOMETRY>(
-              lmIds[k], StateId(currentFrameId), im, k);
+        const bool observationAdded =
+            estimator.addObservation<CAMERA_GEOMETRY>(
+                lmIds[k], StateId(currentFrameId), im, k);
+        if (diagnosticFrame && observationAdded) {
+          ++diagnosticFrame->record.observationsAdded;
+        }
+        if (diagnosticFrame && !loopClosureLandmarksToUseExclusively) {
+          auto& cameraDiagnostics = diagnosticFrame->mapMatching.at(im);
+          ++cameraDiagnostics.acceptedInitialised;
+          cameraDiagnostics.acceptedDescriptorDistance.add(distances[k]);
+          cameraDiagnostics.predictedReprojectionErrorPx.add(
+              matchedReprojectionErrors[k]);
+        }
         if (landmarksToMatch[lmIds[k]].ignore) {
           estimator.setObservationInformation(StateId(currentFrameId), im, k,
                                               Eigen::Matrix2d::Identity()*0.00001);
@@ -1532,8 +1775,22 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   }
   bool secondRansac = false;
   if(runRansac) {
+    uint32_t triggerMask = 0;
+    if (!params.imu.use) {
+      triggerMask |= triggerBit(diagnostics::RansacTrigger::NoImu);
+    }
+    if (reprErr > strictReprThreshold) {
+      triggerMask |=
+          triggerBit(diagnostics::RansacTrigger::LargeReprojectionError);
+    }
+    const diagnostics::RansacTrigger primaryTrigger =
+        !params.imu.use
+            ? diagnostics::RansacTrigger::NoImu
+            : diagnostics::RansacTrigger::LargeReprojectionError;
     const bool ransacSuccess = runRansac3d2d(estimator, multiFrame->cameraSystem(), multiFrame,
-                                             runRansac, ransacRemoveOutliers);
+                                             runRansac, ransacRemoveOutliers,
+                                             primaryTrigger, triggerMask,
+                                             dataAssociationStartPose);
     T_WS1 = estimator.pose(StateId(currentFrameId));
     if (!ransacSuccess) {
       numInitIter += 4;
@@ -1581,6 +1838,18 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     std::vector<LandmarkId> lmIds(numKeypoints);
     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
     std::vector<size_t> ctrs(num_matching_threads);
+    std::vector<diagnostics::CameraMapMatchAccumulator> threadDiagnostics;
+    std::vector<diagnostics::TriangulationAccumulator>
+        threadTriangulationDiagnostics;
+    if (diagnosticFrame && !loopClosureLandmarksToUseExclusively) {
+      threadDiagnostics.resize(num_matching_threads);
+      threadTriangulationDiagnostics.reserve(num_matching_threads);
+      for (size_t thread = 0; thread < num_matching_threads; ++thread) {
+        threadTriangulationDiagnostics.emplace_back(
+            diagnostics::TriangulationSource::UninitialisedLandmark,
+            static_cast<int>(im), -1);
+      }
+    }
 
     std::vector<std::thread*> threads(num_matching_threads, nullptr);
     for(size_t t = 0; t<num_matching_threads; ++t) {
@@ -1590,12 +1859,22 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
               loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
               std::cref(landmarksToMatchVec[im]), numKeypoints,
               std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
-              std::ref(lmIds), std::ref(hps_W), std::ref(ctrs));
+              std::ref(lmIds), std::ref(hps_W), std::ref(ctrs),
+              threadDiagnostics.empty() ? nullptr : &threadDiagnostics[t],
+              threadTriangulationDiagnostics.empty()
+                  ? nullptr
+                  : &threadTriangulationDiagnostics[t]);
     }
 
     for(size_t t = 0; t<num_matching_threads; ++t) {
       threads[t]->join();
       delete threads[t];
+    }
+    if (diagnosticFrame && !loopClosureLandmarksToUseExclusively) {
+      auto& cameraDiagnostics = diagnosticFrame->mapMatching.at(im);
+      for (const auto& threadDiagnostic : threadDiagnostics) {
+        cameraDiagnostics.merge(threadDiagnostic);
+      }
     }
 
     // now insert observations
@@ -1605,7 +1884,14 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
         if(previousId && loopClosureLandmarksToUseExclusively) {
           // remove
-          estimator.removeObservation(StateId(currentFrameId), im, k);
+          if (diagnosticFrame) {
+            ++diagnosticFrame->record.observationsRemovedByReason.at(
+                static_cast<size_t>(
+                    diagnostics::RemovalReason::LoopClosureReassociation));
+          }
+          estimator.removeObservation(
+              StateId(currentFrameId), im, k,
+              diagnostics::RemovalReason::LoopClosureReassociation);
           oldIds.push_back(LandmarkId(previousId));
           newIds.push_back(lmIds[k]);
         }
@@ -1649,7 +1935,11 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
           }
 
           // accept and set position
-          estimator.setLandmark(lmIds[k], hps_W[k], true);
+          if (estimator.setLandmark(lmIds[k], hps_W[k], true) &&
+              !threadTriangulationDiagnostics.empty()) {
+            threadTriangulationDiagnostics.front()
+                .recordLandmarkInitialisation();
+          }
         } else {
           auto s1 = cam1->projectHomogeneous(T_WC1.inverse() * Eigen::Vector4d(mpt.point), &pt1p);
           if (!(s1 == cameras::ProjectionStatus::Successful && (pt1 - pt1p).norm() < 4.0)) {
@@ -1659,13 +1949,37 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
         // accept and set observation
         multiFrame->setLandmarkId(im, k, lmIds[k].value());
-        estimator.addObservation<CAMERA_GEOMETRY>(
-            lmIds[k], StateId(currentFrameId), im, k);
+        const bool observationAdded =
+            estimator.addObservation<CAMERA_GEOMETRY>(
+                lmIds[k], StateId(currentFrameId), im, k);
+        if (diagnosticFrame && observationAdded) {
+          ++diagnosticFrame->record.observationsAdded;
+        }
+        if (diagnosticFrame && !loopClosureLandmarksToUseExclusively) {
+          auto& cameraDiagnostics = diagnosticFrame->mapMatching.at(im);
+          ++cameraDiagnostics.acceptedUninitialised;
+          cameraDiagnostics.acceptedDescriptorDistance.add(distances[k]);
+          cameraDiagnostics.predictedReprojectionErrorPx.add(
+              (pt1 - pt1p).norm());
+        }
         if (landmarksToMatch[lmIds[k]].ignore) {
           estimator.setObservationInformation(StateId(currentFrameId), im, k,
                                               Eigen::Matrix2d::Identity()*0.00001);
         }
         ctr++;
+      }
+    }
+    if (diagnosticFrame && !threadTriangulationDiagnostics.empty()) {
+      const auto key = std::make_tuple(
+          diagnostics::TriangulationSource::UninitialisedLandmark,
+          static_cast<int>(im), -1);
+      auto inserted = diagnosticFrame->triangulation.emplace(
+          key, diagnostics::TriangulationAccumulator(
+                   diagnostics::TriangulationSource::UninitialisedLandmark,
+                   static_cast<int>(im), -1));
+      for (const auto& threadDiagnostic :
+           threadTriangulationDiagnostics) {
+        inserted.first->second.merge(threadDiagnostic);
       }
     }
   }
@@ -1674,13 +1988,33 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   // merge landmarks, if loop-closure matching
   if(loopClosureLandmarksToUseExclusively) {
     estimator.mergeLandmarks(oldIds, newIds);
+    if (diagnosticFrame) {
+      diagnosticFrame->record.loopClosureMapMatches +=
+          static_cast<size_t>(std::max(0, ctr));
+    }
   }
 
   // final two steps optimisation
   if (secondRansac) {
     LOG(INFO) << "Running RANSAC also with uninitialised landmarks";
+    uint32_t triggerMask =
+        triggerBit(
+            diagnostics::RansacTrigger::RetryWithUninitialisedLandmarks);
+    if (!params.imu.use) {
+      triggerMask |= triggerBit(diagnostics::RansacTrigger::NoImu);
+    }
+    if (reprErr > strictReprThreshold) {
+      triggerMask |=
+          triggerBit(diagnostics::RansacTrigger::LargeReprojectionError);
+    }
+    if (ctr <= 3 && isInitialized_) {
+      triggerMask |=
+          triggerBit(diagnostics::RansacTrigger::TooFewAcceptedMatches);
+    }
     const bool ransacSuccess = runRansac3d2d(estimator, multiFrame->cameraSystem(), multiFrame,
-                                             secondRansac, ransacRemoveOutliers);
+        secondRansac, ransacRemoveOutliers,
+        diagnostics::RansacTrigger::RetryWithUninitialisedLandmarks,
+        triggerMask, dataAssociationStartPose);
     T_WS1 = estimator.pose(StateId(currentFrameId));
     if (!ransacSuccess) {
       numInitIter += 4;
@@ -1706,7 +2040,9 @@ void Frontend::matchToMapByThread(
     size_t im, const MultiFramePtr&  multiFrame, std::vector<double>& distances,
     std::vector<LandmarkId>& lmIds, AlignedVector<Eigen::Vector4d>& hps_W,
     std::vector<size_t>& ctrs,
-    std::vector<double>& reprErrors) const {
+    std::vector<double>& reprErrors,
+    diagnostics::CameraMapMatchAccumulator* diagnosticAccumulator,
+    std::vector<double>* matchedReprojectionErrors) const {
 
   const kinematics::Transformation T_SC = *multiFrame->T_SC(im);
   const kinematics::Transformation T_WC1 = T_WS1 * T_SC;
@@ -1726,6 +2062,11 @@ void Frontend::matchToMapByThread(
   const size_t endK = threadIdx+1 == numThreads ? numKeypoints : startK + segment;
   const uchar* ddata = multiFrame->keypointDescriptor(im, 0);
   Eigen::Matrix2Xd keypoints(2,numKeypoints);
+  std::vector<double> diagnosticBestDistances;
+  if (diagnosticAccumulator) {
+    diagnosticBestDistances.resize(
+        endK - startK, std::numeric_limits<double>::infinity());
+  }
   std::vector<bool> use(numKeypoints, true);
   for(size_t k = startK; k < endK; k++) {
     Eigen::Vector2d keypoint;
@@ -1768,11 +2109,30 @@ void Frontend::matchToMapByThread(
         const double dist = brisk::Hamming::PopcntofXORed(
             descriptorK,
             it->second.descriptors.data + d*48, 3);
+        if (diagnosticAccumulator) {
+          ++diagnosticAccumulator->descriptorComparisons;
+          diagnosticBestDistances[k - startK] =
+              std::min(diagnosticBestDistances[k - startK], dist);
+        }
         if(dist < distances[k]) {
           distances[k] = dist;
           lmIds[k] = it->first;
           ctrs[threadIdx]++;
           reprErrors[threadIdx] += sqrt(reprDist.dot(reprDist));
+          if (matchedReprojectionErrors) {
+            matchedReprojectionErrors->at(k) =
+                std::sqrt(reprDist.dot(reprDist));
+          }
+        }
+      }
+    }
+  }
+  if (diagnosticAccumulator) {
+    for (const double distance : diagnosticBestDistances) {
+      if (std::isfinite(distance)) {
+        diagnosticAccumulator->bestDescriptorDistance.add(distance);
+        if (distance < briskMatchingThreshold_) {
+          ++diagnosticAccumulator->descriptorCandidatesBelowThreshold;
         }
       }
     }
@@ -1791,7 +2151,10 @@ void Frontend::matchToMapByThreadUnitialised(
     size_t numKeypoints, const MapPoints& pointMap,
     size_t im, const MultiFramePtr&  multiFrame, std::vector<double>& distances,
     std::vector<LandmarkId>& lmIds, AlignedVector<Eigen::Vector4d>& hps_W,
-    std::vector<size_t>& ctrs) const {
+    std::vector<size_t>& ctrs,
+    diagnostics::CameraMapMatchAccumulator* diagnosticAccumulator,
+    diagnostics::TriangulationAccumulator*
+        triangulationDiagnosticAccumulator) const {
 
   const kinematics::Transformation T_SC = *multiFrame->T_SC(im);
   const kinematics::Transformation T_WC1 = T_WS1 * T_SC;
@@ -1809,11 +2172,20 @@ void Frontend::matchToMapByThreadUnitialised(
   const size_t endK = threadIdx+1 == numThreads ? numKeypoints : startK + segment;
   const uchar* ddata = multiFrame->keypointDescriptor(im, 0);
   Eigen::Matrix3Xd e_Ws(3,numKeypoints);
+  Eigen::Matrix2Xd currentKeypoints(2, numKeypoints);
   std::vector<uint64_t> previousIds(numKeypoints,0);
   std::vector<bool> use(numKeypoints,false);
+  std::vector<double> diagnosticBestDistances;
+  if (diagnosticAccumulator) {
+    diagnosticBestDistances.resize(
+        endK - startK, std::numeric_limits<double>::infinity());
+  }
   for(size_t k = startK; k < endK; k++) {
     Eigen::Vector3d e1_C;
     if(multiFrame->getBackProjection(im, k, e1_C)){
+      Eigen::Vector2d currentKeypoint;
+      multiFrame->getKeypoint(im, k, currentKeypoint);
+      currentKeypoints.col(k) = currentKeypoint;
       const Eigen::Vector3d e1_W = T_WC1.C()*e1_C.normalized();
       e_Ws.col(k) = e1_W;
       const uint64_t previousId = multiFrame->landmarkId(im,k);
@@ -1851,8 +2223,16 @@ void Frontend::matchToMapByThreadUnitialised(
       for(int d = 0; d<it->second.descriptors.rows; ++d) {
         const double dist = brisk::Hamming::PopcntofXORed(
             descriptorK, it->second.descriptors.data + d*48, 3);
+        if (diagnosticAccumulator) {
+          ++diagnosticAccumulator->descriptorComparisons;
+          diagnosticBestDistances[k - startK] =
+              std::min(diagnosticBestDistances[k - startK], dist);
+        }
 
         if(dist < distances[k]) {
+          if (triangulationDiagnosticAccumulator) {
+            triangulationDiagnosticAccumulator->recordDescriptorCandidate();
+          }
 
           // epipolar distance check
           const Eigen::Vector3d e0_W = it->second.e_W.col(d);
@@ -1863,9 +2243,22 @@ void Frontend::matchToMapByThreadUnitialised(
             const Eigen::Vector3d n0_W = e0_W.cross(et_W).normalized();
             const Eigen::Vector3d n1_W = e1_W.cross(et_W).normalized();
             if((n0_W.dot(n1_W) < cos6Sigma)) {
+              if (diagnosticAccumulator) {
+                ++diagnosticAccumulator->epipolarRejected;
+              }
+              if (triangulationDiagnosticAccumulator) {
+                triangulationDiagnosticAccumulator->recordEpipolarRejected();
+              }
               continue; // not in epipolar plane
             }
             if((e0_W.cross(e1_W)).dot((n0_W + n0_W).normalized())>0.0) {
+              if (diagnosticAccumulator) {
+                ++diagnosticAccumulator->divergentRayRejected;
+              }
+              if (triangulationDiagnosticAccumulator) {
+                triangulationDiagnosticAccumulator
+                    ->recordDivergentRaysRejected();
+              }
               continue; // divergent rays
             }
           }
@@ -1875,6 +2268,21 @@ void Frontend::matchToMapByThreadUnitialised(
           bool isParallel = false;
           Eigen::Vector4d hp_W = triangulation::triangulateFast(
               r0_W, e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
+
+          if (triangulationDiagnosticAccumulator) {
+            const std::optional<double> angle =
+                diagnostics::rayAngle(e0_W, e1_W);
+            const double depth =
+                isValid && std::abs(hp_W[3]) > 1.0e-12
+                    ? (hp_W.head<3>() / hp_W[3] - r0_W).norm()
+                    : std::numeric_limits<double>::quiet_NaN();
+            triangulationDiagnosticAccumulator->recordAttempt(
+                diagnostics::cameraBaseline(r0_W, T_WC1.r()),
+                angle.value_or(std::numeric_limits<double>::quiet_NaN()),
+                diagnostics::pixelDisplacement(
+                    it->second.keypoints.col(d), currentKeypoints.col(k)),
+                depth, isValid, isParallel);
+          }
 
           if(!isValid) {
             continue;
@@ -1889,6 +2297,9 @@ void Frontend::matchToMapByThreadUnitialised(
             isValid = false;
           }
           if(!isValid) {
+            if (triangulationDiagnosticAccumulator) {
+              triangulationDiagnosticAccumulator->recordDepthRejected();
+            }
             continue;
           }
 
@@ -1902,7 +2313,20 @@ void Frontend::matchToMapByThreadUnitialised(
           ctrs[threadIdx]++;
           if(!isParallel) {
             hps_W[k] = hp_W;
+            if (triangulationDiagnosticAccumulator) {
+              triangulationDiagnosticAccumulator->recordInitialisable();
+            }
           }
+        }
+      }
+    }
+  }
+  if (diagnosticAccumulator) {
+    for (const double distance : diagnosticBestDistances) {
+      if (std::isfinite(distance)) {
+        diagnosticAccumulator->bestDescriptorDistance.add(distance);
+        if (distance < briskMatchingThreshold_) {
+          ++diagnosticAccumulator->descriptorCandidatesBelowThreshold;
         }
       }
     }
@@ -1926,6 +2350,13 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
   rotationOnly = true;
 
   kinematics::Transformation T_WS1 = estimator.pose(StateId(currentFrameId));
+  std::shared_ptr<diagnostics::FrontendFrameAccumulator> diagnosticFrame;
+  if (diagnosticFrames_) {
+    const MultiFramePtr currentFrame =
+        estimator.multiFrame(StateId(currentFrameId));
+    diagnosticFrame = diagnosticFrames_->bindFrame(
+        currentFrameId, currentFrame->timestamp().toNSec());
+  }
 
   // find close frames
   TimerSwitchable matchMotionStereoTimer2("2.02.1 match motion stereo: prepare");
@@ -1992,13 +2423,30 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
       desc1 = desc1(cv::Rect(0,0,48,k1s.size()));
 
       AlignedVector<MatchInfo> matchInfos(k0Size);
+      const size_t matchingThreads =
+          size_t(params.frontend.num_matching_threads);
+      std::vector<diagnostics::TriangulationAccumulator>
+          threadTriangulationDiagnostics;
+      if (diagnosticFrame) {
+        threadTriangulationDiagnostics.reserve(matchingThreads);
+        for (size_t thread = 0; thread < matchingThreads; ++thread) {
+          threadTriangulationDiagnostics.emplace_back(
+              diagnostics::TriangulationSource::TemporalMotionStereo,
+              static_cast<int>(im), static_cast<int>(im));
+        }
+      }
 
       // vector container stores threads
       std::vector<std::thread> workers;
-      for (size_t t = 0; t < size_t(params.frontend.num_matching_threads); t++) {
+      for (size_t t = 0; t < matchingThreads; t++) {
         workers.push_back(std::thread([this, t, k0Size, im, &multiFrame0, &estimator, f0, k1s,
                                       &T_WC0, &T_WC1, &multiFrame1, &olderFrameId, &matchInfos,
-                                       &params, &camera, desc1]() {
+                                      &params, &camera, desc1,
+                                      &threadTriangulationDiagnostics]() {
+          diagnostics::TriangulationAccumulator* triangulationDiagnostic =
+              threadTriangulationDiagnostics.empty()
+                  ? nullptr
+                  : &threadTriangulationDiagnostics[t];
           for(size_t k0 = t; k0 < k0Size; k0 += size_t(params.frontend.num_matching_threads)) {
             uint64_t id0 = multiFrame0->landmarkId(im, k0);
             if(id0) {
@@ -2036,18 +2484,48 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
               const uint32_t dist = brisk::Hamming::PopcntofXORed(
                   d0, desc1.data+kk*48, 3);
               if(dist < distances) {
+                if (triangulationDiagnostic) {
+                  triangulationDiagnostic->recordDescriptorCandidate();
+                }
                 // it's a match!
 
                 // triangulate
                 bool isValid = false;
                 bool isParallel = false;
                 Eigen::Vector3d e1_C;
-                if(!multiFrame1->getBackProjection(im, k1, e1_C)) continue;
+                if(!multiFrame1->getBackProjection(im, k1, e1_C)) {
+                  if (triangulationDiagnostic) {
+                    triangulationDiagnostic->recordBackProjectionRejected();
+                  }
+                  continue;
+                }
                 const Eigen::Vector3d e1_W = (T_WC1.C()*e1_C).normalized();
-                if(e0_W.dot(e1_W) < 0.5) continue;
+                if(e0_W.dot(e1_W) < 0.5) {
+                  if (triangulationDiagnostic) {
+                    triangulationDiagnostic->recordDivergentRaysRejected();
+                  }
+                  continue;
+                }
 
                 Eigen::Vector4d hp_W = triangulation::triangulateFast(
                       T_WC0.r(), e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
+
+                Eigen::Vector2d pt1;
+                multiFrame1->getKeypoint(im, k1, pt1);
+                if (triangulationDiagnostic) {
+                  const std::optional<double> angle =
+                      diagnostics::rayAngle(e0_W, e1_W);
+                  const double depth =
+                      isValid && std::abs(hp_W[3]) > 1.0e-12
+                          ? (hp_W.head<3>() / hp_W[3] - T_WC0.r()).norm()
+                          : std::numeric_limits<double>::quiet_NaN();
+                  triangulationDiagnostic->recordAttempt(
+                      diagnostics::cameraBaseline(T_WC0.r(), T_WC1.r()),
+                      angle.value_or(
+                          std::numeric_limits<double>::quiet_NaN()),
+                      diagnostics::pixelDisplacement(pt0, pt1), depth,
+                      isValid, isParallel);
+                }
 
                 if(!isValid) {
                   continue;
@@ -2059,14 +2537,23 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
 
                 if(e0_W.transpose()*e1_W < 0.8) {
                   isValid = false;
+                  if (triangulationDiagnostic) {
+                    triangulationDiagnostic->recordDivergentRaysRejected();
+                  }
                 }
 
                 hp_W = hp_W/hp_W[3];
                 if(hp_C0[2]/hp_C0[3] < 0.2) {
                   isValid = false;
+                  if (triangulationDiagnostic) {
+                    triangulationDiagnostic->recordDepthRejected();
+                  }
                 }
                 if(hp_C1[2]/hp_C1[3] < 0.2) {
                   isValid = false;
+                  if (triangulationDiagnostic) {
+                    triangulationDiagnostic->recordDepthRejected();
+                  }
                 }
 
                 // remember
@@ -2077,7 +2564,12 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
                                  .dot((hp_W.head<3>()-T_WC1.r()).normalized()));
                   hps_W = hp_W;
                   initialisable = !isParallel;
+                  if (initialisable && triangulationDiagnostic) {
+                    triangulationDiagnostic->recordInitialisable();
+                  }
                 }
+              } else if (triangulationDiagnostic) {
+                triangulationDiagnostic->recordDescriptorRejected();
               }
             }
 
@@ -2089,6 +2581,12 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
               auto s1 = camera->projectHomogeneous(T_WC1.inverse()*hps_W, &pt1p);
               if(s1 == cameras::ProjectionStatus::Successful && (pt1-pt1p).norm()<4.0) {
                 matchInfos[k0] = MatchInfo{hps_W, k1_max, true, initialisable, quality};
+              } else if (triangulationDiagnostic) {
+                if (s1 != cameras::ProjectionStatus::Successful) {
+                  triangulationDiagnostic->recordProjectionRejected();
+                } else {
+                  triangulationDiagnostic->recordReprojectionRejected();
+                }
               }
             }
           }
@@ -2129,20 +2627,53 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
           MapPoint2 lm;
           estimator.getLandmark(LandmarkId(id0), lm);
           if(lm.quality<mInfo.quality) {
-            estimator.setLandmark(LandmarkId(id0), mInfo.hp_W, mInfo.initialisable);
+            if (estimator.setLandmark(LandmarkId(id0), mInfo.hp_W,
+                                      mInfo.initialisable) &&
+                mInfo.initialisable &&
+                !threadTriangulationDiagnostics.empty()) {
+              threadTriangulationDiagnostics.front()
+                  .recordLandmarkInitialisation();
+            }
           }
         } else {
           id0 = estimator.addLandmark(mInfo.hp_W, mInfo.initialisable).value();
+          if (!threadTriangulationDiagnostics.empty()) {
+            threadTriangulationDiagnostics.front().recordLandmarkBirth();
+            if (mInfo.initialisable) {
+              threadTriangulationDiagnostics.front()
+                  .recordLandmarkInitialisation();
+            }
+          }
           multiFrame0->setLandmarkId(im, k0, id0);
           OKVIS_ASSERT_TRUE_DBG(Exception, estimator.isLandmarkAdded(LandmarkId(id0)),
                               id0<<" not added, bug")
-          estimator.addObservation<CAMERA_GEOMETRY>(LandmarkId(id0), StateId(olderFrameId), im, k0);
+          if (estimator.addObservation<CAMERA_GEOMETRY>(
+                  LandmarkId(id0), StateId(olderFrameId), im, k0) &&
+              diagnosticFrame) {
+            ++diagnosticFrame->record.observationsAdded;
+          }
         }
 
         multiFrame1->setLandmarkId(im, mInfo.k1, id0);
-        estimator.addObservation<CAMERA_GEOMETRY>(
-              LandmarkId(id0), StateId(currentFrameId), im, mInfo.k1);
+        if (estimator.addObservation<CAMERA_GEOMETRY>(
+                LandmarkId(id0), StateId(currentFrameId), im, mInfo.k1) &&
+            diagnosticFrame) {
+          ++diagnosticFrame->record.observationsAdded;
+        }
         retCtr++;
+      }
+      if (diagnosticFrame && !threadTriangulationDiagnostics.empty()) {
+        const auto key = std::make_tuple(
+            diagnostics::TriangulationSource::TemporalMotionStereo,
+            static_cast<int>(im), static_cast<int>(im));
+        auto inserted = diagnosticFrame->triangulation.emplace(
+            key, diagnostics::TriangulationAccumulator(
+                     diagnostics::TriangulationSource::TemporalMotionStereo,
+                     static_cast<int>(im), static_cast<int>(im)));
+        for (const auto& threadDiagnostic :
+             threadTriangulationDiagnostics) {
+          inserted.first->second.merge(threadDiagnostic);
+        }
       }
     }
 
@@ -2174,6 +2705,11 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
 
   // needed later:
   kinematics::Transformation T_WS = estimator.pose(StateId(mfId));
+  std::shared_ptr<diagnostics::FrontendFrameAccumulator> diagnosticFrame;
+  if (diagnosticFrames_) {
+    diagnosticFrame = diagnosticFrames_->bindFrame(
+        mfId, multiFrame->timestamp().toNSec());
+  }
 
   for (size_t im0 = 0; im0 < camNumber; im0++) {
     const kinematics::Transformation T_SC0 = *multiFrame->T_SC(im0);
@@ -2191,6 +2727,14 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
       const kinematics::Transformation T_SC1 = *multiFrame->T_SC(im1);
       const kinematics::Transformation T_WC0 = T_WS * T_SC0;
       const kinematics::Transformation T_WC1 = T_WS * T_SC1;
+      std::unique_ptr<diagnostics::TriangulationAccumulator>
+          triangulationDiagnostic;
+      if (diagnosticFrame) {
+        triangulationDiagnostic.reset(
+            new diagnostics::TriangulationAccumulator(
+                diagnostics::TriangulationSource::SpatialStereo,
+                static_cast<int>(im0), static_cast<int>(im1)));
+      }
 
       {
         // match
@@ -2213,6 +2757,9 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
                 multiFrame->keypointDescriptor(im0, k0),
                   multiFrame->keypointDescriptor(im1, k1), 3);
             if(dist < distances) {
+              if (triangulationDiagnostic) {
+                triangulationDiagnostic->recordDescriptorCandidate();
+              }
               // it's a match!
               double size0, size1;
               multiFrame->getKeypointSize(im0, k0, size0);
@@ -2226,12 +2773,37 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
               bool isValid = false;
               bool isParallel = false;
               Eigen::Vector3d e0_C, e1_C;
-              if(!multiFrame->getBackProjection(im0, k0, e0_C)) continue;
-              if(!multiFrame->getBackProjection(im1, k1, e1_C)) continue;
+              if(!multiFrame->getBackProjection(im0, k0, e0_C)) {
+                if (triangulationDiagnostic) {
+                  triangulationDiagnostic->recordBackProjectionRejected();
+                }
+                continue;
+              }
+              if(!multiFrame->getBackProjection(im1, k1, e1_C)) {
+                if (triangulationDiagnostic) {
+                  triangulationDiagnostic->recordBackProjectionRejected();
+                }
+                continue;
+              }
               Eigen::Vector3d e0_W = (T_WC0.C()*e0_C).normalized();
               Eigen::Vector3d e1_W = (T_WC1.C()*e1_C).normalized();
               Eigen::Vector4d hp_W = triangulation::triangulateFast(
                     T_WC0.r(), e0_W, T_WC1.r(), e1_W, sigma, isValid, isParallel);
+
+              if (triangulationDiagnostic) {
+                const std::optional<double> angle =
+                    diagnostics::rayAngle(e0_W, e1_W);
+                const double depth =
+                    isValid && std::abs(hp_W[3]) > 1.0e-12
+                        ? (hp_W.head<3>() / hp_W[3] - T_WC0.r()).norm()
+                        : std::numeric_limits<double>::quiet_NaN();
+                triangulationDiagnostic->recordAttempt(
+                    diagnostics::cameraBaseline(T_WC0.r(), T_WC1.r()),
+                    angle.value_or(
+                        std::numeric_limits<double>::quiet_NaN()),
+                    diagnostics::pixelDisplacement(pt0, pt1), depth, isValid,
+                    isParallel);
+              }
 
               // check if too close
               const Eigen::Vector4d hp_C0 = (T_WC0.inverse()*hp_W);
@@ -2241,13 +2813,22 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
 
               if(hp_C0[2]/hp_C0[3] < 0.1) {
                 isValid = false;
+                if (triangulationDiagnostic) {
+                  triangulationDiagnostic->recordDepthRejected();
+                }
               }
               if(hp_C1[2]/hp_C1[3] <  0.1) {
                 isValid = false;
+                if (triangulationDiagnostic) {
+                  triangulationDiagnostic->recordDepthRejected();
+                }
               }
 
               if(e0_W.transpose()*e1_W < 0.8) {
                 isValid = false;
+                if (triangulationDiagnostic) {
+                  triangulationDiagnostic->recordDivergentRaysRejected();
+                }
               }
 
               // add observations and initialise
@@ -2256,7 +2837,12 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
                 hps_W = hp_W;
                 k1_match = k1;
                 initialisable = !isParallel;
+                if (initialisable && triangulationDiagnostic) {
+                  triangulationDiagnostic->recordInitialisable();
+                }
               }
+            } else if (triangulationDiagnostic) {
+              triangulationDiagnostic->recordDescriptorRejected();
             }
           }
 
@@ -2278,7 +2864,12 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
                 // only re-assess initialisation
                 if(initialisable) {
                   //estimator.setLandmarkInitialized(id0, initialiseable);
-                  estimator.setLandmark(LandmarkId(id0), hps_W, true); /// \todo check true
+                  if (estimator.setLandmark(LandmarkId(id0), hps_W,
+                                            true) &&
+                      triangulationDiagnostic) {
+                    triangulationDiagnostic
+                        ->recordLandmarkInitialisation();
+                  } /// \todo check true
                 }
               } // else we do nothing, because already initialised and matched.
             } else if(id1) {
@@ -2299,6 +2890,12 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
               // need new point
 
               lmId = estimator.addLandmark(hps_W, initialisable).value();
+              if (triangulationDiagnostic) {
+                triangulationDiagnostic->recordLandmarkBirth();
+                if (initialisable) {
+                  triangulationDiagnostic->recordLandmarkInitialisation();
+                }
+              }
               OKVIS_ASSERT_TRUE_DBG(
                   Exception, estimator.isLandmarkAdded(LandmarkId(lmId)),
                   lmId<<" not added, bug")
@@ -2313,7 +2910,17 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
               if(s0 == cameras::ProjectionStatus::Successful && (pt0-pt0p).norm()<4.0) {
                 // safe to add.
                 multiFrame->setLandmarkId(im0, k0, lmId);
-                estimator.addObservation<CAMERA_GEOMETRY>(LandmarkId(lmId), StateId(mfId), im0, k0);
+                if (estimator.addObservation<CAMERA_GEOMETRY>(
+                        LandmarkId(lmId), StateId(mfId), im0, k0) &&
+                    diagnosticFrame) {
+                  ++diagnosticFrame->record.observationsAdded;
+                }
+              } else if (triangulationDiagnostic) {
+                if (s0 != cameras::ProjectionStatus::Successful) {
+                  triangulationDiagnostic->recordProjectionRejected();
+                } else {
+                  triangulationDiagnostic->recordReprojectionRejected();
+                }
               }
             }
             if(add1) {
@@ -2325,12 +2932,32 @@ void Frontend::matchStereo(Estimator &estimator, std::shared_ptr<okvis::MultiFra
               auto s1 = camera1->projectHomogeneous(T_WC1.inverse()*hp_eff_W, &pt1p);
               if(s1 == cameras::ProjectionStatus::Successful && (pt1-pt1p).norm()<4.0) {
                 multiFrame->setLandmarkId(im1, k1_match, lmId);
-                estimator.addObservation<CAMERA_GEOMETRY>(
-                  LandmarkId(lmId), StateId(mfId), im1, k1_match);
+                if (estimator.addObservation<CAMERA_GEOMETRY>(
+                        LandmarkId(lmId), StateId(mfId), im1,
+                        k1_match) &&
+                    diagnosticFrame) {
+                  ++diagnosticFrame->record.observationsAdded;
+                }
+              } else if (triangulationDiagnostic) {
+                if (s1 != cameras::ProjectionStatus::Successful) {
+                  triangulationDiagnostic->recordProjectionRejected();
+                } else {
+                  triangulationDiagnostic->recordReprojectionRejected();
+                }
               }
             }
           }
         }
+      }
+      if (diagnosticFrame && triangulationDiagnostic) {
+        const auto key = std::make_tuple(
+            diagnostics::TriangulationSource::SpatialStereo,
+            static_cast<int>(im0), static_cast<int>(im1));
+        auto inserted = diagnosticFrame->triangulation.emplace(
+            key, diagnostics::TriangulationAccumulator(
+                     diagnostics::TriangulationSource::SpatialStereo,
+                     static_cast<int>(im0), static_cast<int>(im1)));
+        inserted.first->second.merge(*triangulationDiagnostic);
       }
     }
   }
@@ -2380,7 +3007,18 @@ int Frontend::removeOutliers(Estimator &estimator,
             if (!remove) {
               ctr++;
             } else {
-              estimator.removeObservation(StateId(mfId), im, k);
+              std::shared_ptr<diagnostics::FrontendFrameAccumulator>
+                  diagnosticFrame;
+              if (diagnosticFrames_) {
+                diagnosticFrame = diagnosticFrames_->bindFrame(
+                    mfId, currentFrame->timestamp().toNSec());
+                ++diagnosticFrame->record.observationsRemovedByReason.at(
+                    static_cast<size_t>(diagnostics::RemovalReason::
+                                            PostOptimisationReprojection));
+              }
+              estimator.removeObservation(
+                  StateId(mfId), im, k,
+                  diagnostics::RemovalReason::PostOptimisationReprojection);
             }
           }
         }
@@ -2393,10 +3031,43 @@ int Frontend::removeOutliers(Estimator &estimator,
 // Perform 3D/2D RANSAC.
 bool Frontend::runRansac3d2d(
     Estimator &estimator, const okvis::cameras::NCameraSystem& nCameraSystem,
-    std::shared_ptr<okvis::MultiFrame> currentFrame, bool initializePose, bool removeOutliers) {
-  if (estimator.numFrames() < 2) {
-    // nothing to match against, we are just starting up.
-    return false;
+    std::shared_ptr<okvis::MultiFrame> currentFrame, bool initializePose,
+    bool removeOutliers, diagnostics::RansacTrigger primaryTrigger,
+    uint32_t triggerMask,
+    const kinematics::Transformation& dataAssociationStartPose) {
+  std::shared_ptr<diagnostics::FrontendFrameAccumulator> diagnosticFrame;
+  if (diagnosticFrames_) {
+    diagnosticFrame = diagnosticFrames_->bindFrame(
+        currentFrame->id(), currentFrame->timestamp().toNSec());
+  }
+  diagnostics::RansacDiagnosticRecord diagnosticRecord;
+  diagnosticRecord.timestampNs = currentFrame->timestamp().toNSec();
+  diagnosticRecord.frameId = currentFrame->id();
+  diagnosticRecord.primaryTrigger = primaryTrigger;
+  diagnosticRecord.triggerMask = triggerMask;
+  diagnosticRecord.dataAssociationStartPose =
+      toDiagnosticPose(dataAssociationStartPose);
+  diagnosticRecord.preInvocationPose =
+      toDiagnosticPose(estimator.pose(StateId(currentFrame->id())));
+  diagnosticRecord.correspondencesPerCamera.resize(numCameras_);
+  diagnosticRecord.inliersPerCamera.resize(numCameras_);
+
+  const auto appendDiagnosticRecord = [&]() {
+    if (diagnosticFrame) {
+      diagnosticRecord.invocation = diagnosticFrame->ransac.size();
+      diagnosticFrame->ransac.push_back(diagnosticRecord);
+    }
+  };
+
+  const bool hasPriorFrame = estimator.numFrames() >= 2;
+  if (!hasPriorFrame) {
+    const auto outcome = diagnostics::classifyRansacOutcome(
+        false, 0, 0, false);
+    diagnosticRecord.status = outcome.status;
+    diagnosticRecord.thresholdSuccess = outcome.thresholdSuccess;
+    diagnosticRecord.returnedSuccess = outcome.returnedSuccess;
+    appendDiagnosticRecord();
+    return outcome.returnedSuccess;
   }
 
   /////////////////////
@@ -2409,7 +3080,38 @@ bool Frontend::runRansac3d2d(
     estimator, nCameraSystem, currentFrame);
 
   size_t numCorrespondences = adapter.getNumberCorrespondences();
-  if (numCorrespondences < 10) return int(numCorrespondences);
+  diagnosticRecord.correspondences = numCorrespondences;
+  std::vector<std::vector<cv::KeyPoint>> correspondenceKeypoints(numCameras_);
+  for (size_t correspondence = 0; correspondence < numCorrespondences;
+       ++correspondence) {
+    const size_t camera = size_t(adapter.camIndex(correspondence));
+    if (camera >= numCameras_) {
+      continue;
+    }
+    ++diagnosticRecord.correspondencesPerCamera[camera];
+    cv::KeyPoint keypoint;
+    if (currentFrame->getCvKeypoint(
+            camera, size_t(adapter.keypointIndex(correspondence)), keypoint)) {
+      correspondenceKeypoints[camera].push_back(keypoint);
+    }
+  }
+  diagnosticRecord.correspondenceGridFractionPerCamera.reserve(numCameras_);
+  for (size_t camera = 0; camera < numCameras_; ++camera) {
+    diagnosticRecord.correspondenceGridFractionPerCamera.push_back(
+        diagnostics::summarizeKeypoints(
+            correspondenceKeypoints[camera], currentFrame->image(camera).cols,
+            currentFrame->image(camera).rows)
+            .occupiedGridFraction);
+  }
+  if (numCorrespondences < 10) {
+    const auto outcome = diagnostics::classifyRansacOutcome(
+        true, numCorrespondences, 0, false);
+    diagnosticRecord.status = outcome.status;
+    diagnosticRecord.thresholdSuccess = outcome.thresholdSuccess;
+    diagnosticRecord.returnedSuccess = outcome.returnedSuccess;
+    appendDiagnosticRecord();
+    return outcome.returnedSuccess;
+  }
 
   // create a RelativePoseSac problem and RANSAC
   typedef opengv::sac_problems::absolute_pose::FrameAbsolutePoseSacProblem<
@@ -2422,11 +3124,69 @@ bool Frontend::runRansac3d2d(
   ransac.max_iterations_ = 50;
   // initial guess not needed...
   // run the ransac
-  ransac.computeModel(0);
+  const bool modelComputed = ransac.computeModel(0);
 
   // deal with outliers and assign transformation
   numInliers = int(ransac.inliers_.size());
-  if (numInliers >= 10 && double(ransac.inliers_.size())/double(numCorrespondences)>0.7) {
+  diagnosticRecord.modelComputed = modelComputed;
+  diagnosticRecord.inliers = static_cast<size_t>(numInliers);
+  diagnosticRecord.outliers = numCorrespondences -
+                              std::min(numCorrespondences,
+                                       diagnosticRecord.inliers);
+  diagnosticRecord.inlierRatio =
+      double(ransac.inliers_.size()) / double(numCorrespondences);
+  std::vector<std::vector<cv::KeyPoint>> inlierKeypoints(numCameras_);
+  for (const int inlier : ransac.inliers_) {
+    if (inlier < 0 || static_cast<size_t>(inlier) >= numCorrespondences) {
+      continue;
+    }
+    const size_t correspondence = static_cast<size_t>(inlier);
+    const size_t camera = size_t(adapter.camIndex(correspondence));
+    if (camera >= numCameras_) {
+      continue;
+    }
+    ++diagnosticRecord.inliersPerCamera[camera];
+    cv::KeyPoint keypoint;
+    if (currentFrame->getCvKeypoint(
+            camera, size_t(adapter.keypointIndex(correspondence)), keypoint)) {
+      inlierKeypoints[camera].push_back(keypoint);
+    }
+  }
+  diagnosticRecord.inlierGridFractionPerCamera.reserve(numCameras_);
+  for (size_t camera = 0; camera < numCameras_; ++camera) {
+    diagnosticRecord.inlierGridFractionPerCamera.push_back(
+        diagnostics::summarizeKeypoints(
+            inlierKeypoints[camera], currentFrame->image(camera).cols,
+            currentFrame->image(camera).rows)
+            .occupiedGridFraction);
+  }
+
+  const auto outcome = diagnostics::classifyRansacOutcome(
+      true, numCorrespondences, static_cast<size_t>(numInliers),
+      modelComputed);
+  diagnosticRecord.status = outcome.status;
+  diagnosticRecord.thresholdSuccess = outcome.thresholdSuccess;
+  diagnosticRecord.returnedSuccess = outcome.returnedSuccess;
+
+  Eigen::Matrix4d T_WS_mat = Eigen::Matrix4d::Identity();
+  if (modelComputed && ransac.model_coefficients_.allFinite()) {
+    T_WS_mat.topLeftCorner<3, 4>() = ransac.model_coefficients_;
+    const kinematics::Transformation T_WS_model(T_WS_mat);
+    diagnosticRecord.gp3pModelPose = toDiagnosticPose(T_WS_model);
+    const kinematics::Transformation T_start_model =
+        dataAssociationStartPose.inverse() * T_WS_model;
+    const kinematics::Transformation T_pre_model =
+        estimator.pose(StateId(currentFrame->id())).inverse() * T_WS_model;
+    diagnosticRecord.startToModelTranslationM = T_start_model.r().norm();
+    diagnosticRecord.startToModelRotationRad =
+        Eigen::AngleAxisd(T_start_model.C()).angle();
+    diagnosticRecord.preInvocationToModelTranslationM =
+        T_pre_model.r().norm();
+    diagnosticRecord.preInvocationToModelRotationRad =
+        Eigen::AngleAxisd(T_pre_model.C()).angle();
+  }
+
+  if (outcome.thresholdSuccess) {
     // kick out outliers:
     if(removeOutliers) {
       std::vector<bool> inliers(numCorrespondences, false);
@@ -2441,24 +3201,32 @@ bool Frontend::runRansac3d2d(
           size_t keypointIdx = size_t(adapter.keypointIndex(k));
 
           // remove observation
-          estimator.removeObservation(StateId(currentFrame->id()), camIdx, keypointIdx);
+          ++diagnosticRecord.removedObservations;
+          if (diagnosticFrame) {
+            ++diagnosticFrame->record.observationsRemovedByReason.at(
+                static_cast<size_t>(
+                    diagnostics::RemovalReason::Gp3pOutlier));
+          }
+          estimator.removeObservation(
+              StateId(currentFrame->id()), camIdx, keypointIdx,
+              diagnostics::RemovalReason::Gp3pOutlier);
         }
       }
     }
 
     // assign transformation
-    Eigen::Matrix4d T_WS_mat = Eigen::Matrix4d::Identity();
-    T_WS_mat.topLeftCorner<3, 4>() = ransac.model_coefficients_;
     kinematics::Transformation T_WS = kinematics::Transformation(T_WS_mat);
     if(initializePose) {
       estimator.setPose(StateId(currentFrame->id()), T_WS);
     }
-    return true;
+    appendDiagnosticRecord();
+    return outcome.returnedSuccess;
   } else {
     LOG(INFO) << "RANSAC FAIL: " << numInliers << " inliers, ratio = "
               << double(ransac.inliers_.size())/double(numCorrespondences);
   }
-  return false;
+  appendDiagnosticRecord();
+  return outcome.returnedSuccess;
 }
 
 // Perform 2D/2D RANSAC.
@@ -2472,6 +3240,14 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
   int totalInlierNumber = 0;
   bool rotation_only_success = false;
   bool rel_pose_success = false;
+  std::vector<diagnostics::InitialisationDiagnosticRecord> diagnosticRecords;
+  std::shared_ptr<diagnostics::FrontendFrameAccumulator> diagnosticFrame;
+  if (diagnosticFrames_) {
+    const MultiFramePtr currentFrame =
+        estimator.multiFrame(StateId(currentFrameId));
+    diagnosticFrame = diagnosticFrames_->bindFrame(
+        currentFrameId, currentFrame->timestamp().toNSec());
+  }
 
   // run relative RANSAC
   for (size_t im = 0; im < numCameras; ++im) {
@@ -2481,8 +3257,22 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
 
     size_t numCorrespondences = adapter.getNumberCorrespondences();
 
-    if (numCorrespondences < 10)
+    diagnostics::InitialisationDiagnosticRecord diagnosticRecord;
+    diagnosticRecord.timestampNs =
+        estimator.multiFrame(StateId(currentFrameId))->timestamp().toNSec();
+    diagnosticRecord.currentFrameId = currentFrameId;
+    diagnosticRecord.olderFrameId = olderFrameId;
+    diagnosticRecord.camera = static_cast<int>(im);
+    diagnosticRecord.invocation = diagnosticRecords.size();
+    diagnosticRecord.correspondences = numCorrespondences;
+
+    if (numCorrespondences < 10) {
+      diagnosticRecord.selectedModel =
+          diagnostics::InitialisationModelSelection::
+              InsufficientCorrespondences;
+      diagnosticRecords.push_back(diagnosticRecord);
       continue;  // won't generate meaningful results. let's hope the few corresp. are inliers!!
+    }
 
     // try both the rotation-only RANSAC and the relative one:
 
@@ -2497,11 +3287,15 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
     rotation_only_ransac.max_iterations_ = 50;
 
     // run the ransac
-    rotation_only_ransac.computeModel(0);
+    const bool rotationModelComputed = rotation_only_ransac.computeModel(0);
 
     // get quality
     int rotation_only_inliers = int(rotation_only_ransac.inliers_.size());
     float rotation_only_ratio = float(rotation_only_inliers) / float(numCorrespondences);
+    diagnosticRecord.rotationModelComputed = rotationModelComputed;
+    diagnosticRecord.rotationInliers =
+        static_cast<size_t>(rotation_only_inliers);
+    diagnosticRecord.rotationInlierRatio = rotation_only_ratio;
 
     // now the rel_pose one:
     typedef opengv::sac_problems::relative_pose::FrameRelativePoseSacProblem
@@ -2514,11 +3308,25 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
     rel_pose_ransac.max_iterations_ = 50;
 
     // run the ransac
-    rel_pose_ransac.computeModel(0);
+    const bool relativePoseModelComputed = rel_pose_ransac.computeModel(0);
 
     // assess success
     int rel_pose_inliers = int(rel_pose_ransac.inliers_.size());
     float rel_pose_ratio = float(rel_pose_inliers) / float(numCorrespondences);
+    diagnosticRecord.relativePoseModelComputed =
+        relativePoseModelComputed;
+    diagnosticRecord.relativePoseInliers =
+        static_cast<size_t>(rel_pose_inliers);
+    diagnosticRecord.relativePoseInlierRatio = rel_pose_ratio;
+    const diagnostics::InitialisationModelOutcome modelOutcome =
+        diagnostics::classifyInitialisationModels(
+            numCorrespondences, rotationModelComputed,
+            static_cast<size_t>(rotation_only_inliers),
+            relativePoseModelComputed,
+            static_cast<size_t>(rel_pose_inliers));
+    diagnosticRecord.selectedModel = modelOutcome.selection;
+    diagnosticRecord.selectedModelSuccessful = modelOutcome.successful;
+    diagnosticRecord.selectedInliers = modelOutcome.selectedInliers;
 
     // decide on success and fill inliers
     std::vector<bool> inliers(numCorrespondences, false);
@@ -2543,6 +3351,7 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
 
     // failure?
     if (!rotation_only_success && !rel_pose_success) {
+      diagnosticRecords.push_back(diagnosticRecord);
       continue;
     }
 
@@ -2553,7 +3362,14 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
       if (removeOutliers && !inliers[k]) {
         uint64_t lmIdB = multiFrame->landmarkId(im, idxB);
         if(lmIdB !=0) {
-          estimator.removeObservation(StateId(currentFrameId), im, idxB);
+          if (diagnosticFrame) {
+            ++diagnosticFrame->record.observationsRemovedByReason.at(
+                static_cast<size_t>(diagnostics::RemovalReason::
+                                        Initialisation2d2dOutlier));
+          }
+          estimator.removeObservation(
+              StateId(currentFrameId), im, idxB,
+              diagnostics::RemovalReason::Initialisation2d2dOutlier);
         }
       }
     }
@@ -2566,14 +3382,24 @@ int Frontend::runRansac2d2d(Estimator &estimator, const okvis::ViParameters& par
         //LOG(INFO) << "Initializing pose from 2D-2D RANSAC: orientation only";
       }
     }
+    diagnosticRecords.push_back(diagnosticRecord);
   }
 
+  int functionReturnValue = -1;
   if (rel_pose_success || rotation_only_success) {
-    return totalInlierNumber;
+    functionReturnValue = totalInlierNumber;
+  } else {
+    rotationOnly = true;  // hack...
   }
-
-  rotationOnly = true;  // hack...
-  return -1;
+  if (diagnosticFrame) {
+    for (auto& record : diagnosticRecords) {
+      record.functionReturnValue = functionReturnValue;
+      record.functionReturnedSuccess = functionReturnValue >= 0;
+      record.invocation = diagnosticFrame->initialisation.size();
+      diagnosticFrame->initialisation.push_back(record);
+    }
+  }
+  return functionReturnValue;
 
 }
 

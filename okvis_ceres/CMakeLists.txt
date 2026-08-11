@@ -131,4 +131,22 @@ if(BUILD_TESTS)
       ${OKVIS_PRIVATE_CXX_FLAGS}
   )
   add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+
+  set(DIAGNOSTICS_TEST_NAME okvis_ceres_diagnostics_test)
+  add_executable(${DIAGNOSTICS_TEST_NAME}
+    test/TestVioDiagnosticsLifecycle.cpp
+    test/TestVioDiagnosticsEventBuffer.cpp
+    test/test_main.cpp
+  )
+  target_link_libraries(${DIAGNOSTICS_TEST_NAME}
+    ${LIB_NAME}
+    ${GLOG_LIBRARIES}
+    gtest
+  )
+  target_compile_options(${DIAGNOSTICS_TEST_NAME}
+    PUBLIC ${OKVIS_PUBLIC_CXX_FLAGS}
+    PRIVATE ${OKVIS_PRIVATE_CXX_FLAGS}
+  )
+  add_test(NAME ${DIAGNOSTICS_TEST_NAME}
+           COMMAND ${DIAGNOSTICS_TEST_NAME})
 endif()

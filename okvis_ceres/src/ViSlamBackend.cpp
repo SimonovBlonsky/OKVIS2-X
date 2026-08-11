@@ -175,6 +175,10 @@ bool ViSlamBackend::tryGpsAlignment(){
 bool ViSlamBackend::addStates(MultiFramePtr multiFrame, const ImuMeasurementDeque &imuMeasurements,
                               bool asKeyframe)
 {
+  if (diagnostics::VioDiagnostics::instance().enabled()) {
+    realtimeGraph_.setDiagnosticsCollectionEnabled(true);
+    fullGraph_.setDiagnosticsCollectionEnabled(true);
+  }
   AuxiliaryState auxiliaryState;
   auxiliaryState.isImuFrame = true;
   auxiliaryState.isKeyframe = asKeyframe;
@@ -318,6 +322,12 @@ bool ViSlamBackend::addLandmark(LandmarkId landmarkId, const Eigen::Vector4d &la
   } else {
     success &= fullGraph_.addLandmark(landmarkId, landmark, isInitialised);
   }
+  if (success) {
+    const diagnostics::EventContext context =
+        realtimeGraph_.diagnosticsEventContext();
+    realtimeGraph_.registerLandmarkBirth(landmarkId, context, true);
+    fullGraph_.registerLandmarkBirth(landmarkId, context, false);
+  }
   return success;
 }
 
@@ -329,6 +339,10 @@ LandmarkId ViSlamBackend::addLandmark(const Eigen::Vector4d &homogeneousPoint, b
   } else {
     fullGraph_.addLandmark(lmId, homogeneousPoint, initialised);
   }
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
+  realtimeGraph_.registerLandmarkBirth(lmId, context, true);
+  fullGraph_.registerLandmarkBirth(lmId, context, false);
   return lmId;
 }
 
@@ -368,19 +382,38 @@ bool ViSlamBackend::setObservationInformation(
   return true;
 }
 
-bool ViSlamBackend::removeObservation(StateId stateId, size_t camIdx,
-                                      size_t keypointIdx)
+bool ViSlamBackend::removeObservation(
+    StateId stateId, size_t camIdx, size_t keypointIdx,
+    diagnostics::RemovalReason reason)
 {
   KeypointIdentifier kid(stateId.value(), camIdx, keypointIdx);
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
   if(isLoopClosing_ || isLoopClosureAvailable_) {
     touchedLandmarks_.insert(realtimeGraph_.observations_.at(kid).landmarkId);
     touchedStates_.insert(stateId);
   } else {
-    fullGraph_.removeObservation(kid);
+    fullGraph_.removeObservation(kid, reason, context);
   }
-  bool success = realtimeGraph_.removeObservation(kid);
+  bool success = realtimeGraph_.removeObservation(kid, reason, context);
   multiFrames_.at(stateId)->setLandmarkId(camIdx, keypointIdx, 0);
   return success;
+}
+
+std::vector<diagnostics::LandmarkEventRecord>
+ViSlamBackend::takeLandmarkDiagnosticEvents(
+    const diagnostics::GraphRole role) {
+  if (role == diagnostics::GraphRole::Realtime) {
+    return realtimeGraph_.takeDiagnosticEvents();
+  }
+  return fullGraph_.takeDiagnosticEvents();
+}
+
+void ViSlamBackend::flushDiagnostics() {
+  diagnostics::VioDiagnostics& writer =
+      diagnostics::VioDiagnostics::instance();
+  writer.writeLandmarkEvents(realtimeGraph_.takeDiagnosticEvents());
+  writer.writeLandmarkEvents(fullGraph_.takeDiagnosticEvents());
 }
 
 bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConvert,
@@ -406,9 +439,12 @@ bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConv
   std::vector<ViGraphEstimator::PoseGraphEdge> poseGraphEdges;
   std::vector<std::pair<StateId,StateId>> removedTwoPoseErrors;
   std::vector<KeypointIdentifier> removedObservations;
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
   realtimeGraph_.convertToPoseGraphMst(
         framesToConvert, framesToConsider, &poseGraphEdges, &removedTwoPoseErrors,
-        &removedObservations);
+        &removedObservations,
+        diagnostics::RemovalReason::PoseGraphConversion, context);
 
   // remember affected frames
   for (auto addedEdge : poseGraphEdges) {
@@ -442,7 +478,8 @@ bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConv
   } else {
     // replicate fullGraph_
     for(auto obs : removedObservations) {
-      fullGraph_.removeObservation(obs);
+      fullGraph_.removeObservation(
+          obs, diagnostics::RemovalReason::PoseGraphConversion, context);
     }
     for(auto removedTwoPoseError : removedTwoPoseErrors) {
       fullGraph_.removeTwoPoseConstLink(removedTwoPoseError.first, removedTwoPoseError.second);
@@ -527,7 +564,10 @@ void ViSlamBackend::eliminateImuFrames(size_t numImuFrames, std::set<StateId> & 
     } else {
       StateId refId = mostOverlappedStateId(id, false);
       auto observations = realtimeGraph_.states_.at(id).observations;
-      realtimeGraph_.removeAllObservations(id);
+      const diagnostics::EventContext context =
+          realtimeGraph_.diagnosticsEventContext();
+      realtimeGraph_.removeAllObservations(
+          id, diagnostics::RemovalReason::StateMarginalisation, context);
       realtimeGraph_.eliminateStateByImuMerge(id, refId);
 
       // also remove from loop closure frames
@@ -542,7 +582,9 @@ void ViSlamBackend::eliminateImuFrames(size_t numImuFrames, std::set<StateId> & 
         }
         eliminateStates_[id] = refId;
       } else {
-        fullGraph_.removeAllObservations(id); /// \todo make more efficient (copy over)
+        fullGraph_.removeAllObservations(
+            id, diagnostics::RemovalReason::StateMarginalisation,
+            context); /// \todo make more efficient (copy over)
         fullGraph_.eliminateStateByImuMerge(id, refId); /// \todo make more efficient (copy over)
       }
       imuFrames_.erase(id);
@@ -642,13 +684,19 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
       keyFrameEliminated = true;
       if(maxCoObs == 0) {
         // handle weird case that might happen with (almost) no matches
-        realtimeGraph_.removeAllObservations(minId);
+        const diagnostics::EventContext context =
+            realtimeGraph_.diagnosticsEventContext();
+        realtimeGraph_.removeAllObservations(
+            minId, diagnostics::RemovalReason::PoseGraphConversion,
+            context);
         // also manage the full graph, if possible
         if(isLoopClosing_ || isLoopClosureAvailable_) {
           touchedStates_.insert(minId);
           affectedFrames.insert(minId);
         } else {
-          fullGraph_.removeAllObservations(minId);
+          fullGraph_.removeAllObservations(
+              minId, diagnostics::RemovalReason::PoseGraphConversion,
+              context);
         }
         continue;
       }
@@ -765,13 +813,19 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
       framesToConsider.insert(maxId);
       if(maxCoObs == 0) {
         // handle weird case that might happen with (almost) no matches
-        realtimeGraph_.removeAllObservations(minId);
+        const diagnostics::EventContext context =
+            realtimeGraph_.diagnosticsEventContext();
+        realtimeGraph_.removeAllObservations(
+            minId, diagnostics::RemovalReason::PoseGraphConversion,
+            context);
         // also manage the full graph, if possible
         if(isLoopClosing_ || isLoopClosureAvailable_) {
           touchedStates_.insert(minId);
           affectedFrames.insert(minId);
         } else {
-          fullGraph_.removeAllObservations(minId);
+          fullGraph_.removeAllObservations(
+              minId, diagnostics::RemovalReason::PoseGraphConversion,
+              context);
         }
         continue;
       }
@@ -1589,6 +1643,8 @@ void ViSlamBackend::addGpsAlignmentFrame(StateId gpsLossFrameId) {
 bool ViSlamBackend::synchroniseRealtimeAndFullGraph(std::vector<StateId> &updatedStates)
 {
   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_, "cannot synchronise while loop-closing")
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
 
   // first, we move the loop-closure frames into the set of regular keyframes...
   keyFrames_.insert(loopClosureFrames_.begin(), loopClosureFrames_.end());
@@ -1598,7 +1654,9 @@ bool ViSlamBackend::synchroniseRealtimeAndFullGraph(std::vector<StateId> &update
   auto landmarks = fullGraph_.landmarks_;
   for(auto iter = landmarks.begin(); iter != landmarks.end(); ++iter) {
     if(realtimeGraph_.landmarks_.count(iter->first) == 0) {
-      fullGraph_.removeLandmark(iter->first);
+      fullGraph_.removeLandmark(
+          iter->first,
+          diagnostics::RemovalReason::RealtimeFullGraphSync, context);
     }
   }
 
@@ -1654,7 +1712,9 @@ bool ViSlamBackend::synchroniseRealtimeAndFullGraph(std::vector<StateId> &update
   addStatesBacklog_.clear();
 
   for(const auto& eliminateState : eliminateStates_) {
-    fullGraph_.removeAllObservations(eliminateState.first);
+    fullGraph_.removeAllObservations(
+        eliminateState.first,
+        diagnostics::RemovalReason::StateMarginalisation, context);
     /// \todo make more efficient (copy over)
     fullGraph_.eliminateStateByImuMerge(eliminateState.first, eliminateState.second);
     /// \todo make more efficient (copy over)
@@ -1794,7 +1854,9 @@ bool ViSlamBackend::synchroniseRealtimeAndFullGraph(std::vector<StateId> &update
     // remove all
     auto observations = fullGraph_.landmarks_.at(lm).observations;
     for(const auto & obs : observations) {
-      fullGraph_.removeObservation(obs.first);
+      fullGraph_.removeObservation(
+          obs.first,
+          diagnostics::RemovalReason::RealtimeFullGraphSync, context);
     }
   }
   for(auto lm : touchedLandmarks_) {
@@ -1875,7 +1937,11 @@ int ViSlamBackend::cleanUnobservedLandmarks() {
   //                    "trying to clean unobserved landmarks while loop closing")
   //}
   std::map<LandmarkId, std::set<KeypointIdentifier>> removed;
-  int removed1 = realtimeGraph_.cleanUnobservedLandmarks(&removed);
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
+  int removed1 = realtimeGraph_.cleanUnobservedLandmarks(
+      &removed, diagnostics::RemovalReason::UnobservedLandmarkCleanup,
+      context);
   for(const auto & rem : removed) {
     for(const auto & obs : rem.second) {
       // note: it can happen (rarely) that a landmark gets cleaned but then re-added,
@@ -1894,7 +1960,9 @@ int ViSlamBackend::cleanUnobservedLandmarks() {
     }
     return removed1; /// \todo This can be done with some refactoring
   } else {
-    int removed0 = fullGraph_.cleanUnobservedLandmarks();
+    int removed0 = fullGraph_.cleanUnobservedLandmarks(
+        nullptr, diagnostics::RemovalReason::UnobservedLandmarkCleanup,
+        context);
     OKVIS_ASSERT_TRUE(Exception, removed0 == removed1, "landmarks cleaned inconsistent!")
     return removed1;
   }
@@ -1903,7 +1971,11 @@ int ViSlamBackend::cleanUnobservedLandmarks() {
 
 bool ViSlamBackend::mergeLandmark(const LandmarkId &fromId, const LandmarkId &intoId)
 {
-  bool success = (realtimeGraph_.mergeLandmark(fromId, intoId, multiFrames_));
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
+  bool success = realtimeGraph_.mergeLandmark(
+      fromId, intoId, multiFrames_,
+      diagnostics::RemovalReason::ExplicitLandmarkMerge, context);
   // also reset associated keypoints
   auto observations = realtimeGraph_.landmarks_.at(intoId).observations;
   for (const auto &observation : observations) {
@@ -1921,7 +1993,9 @@ bool ViSlamBackend::mergeLandmark(const LandmarkId &fromId, const LandmarkId &in
     touchedLandmarks_.insert(intoId);
   } else {
     // now merge
-    success &= fullGraph_.mergeLandmark(fromId, intoId, multiFrames_);
+    success &= fullGraph_.mergeLandmark(
+        fromId, intoId, multiFrames_,
+        diagnostics::RemovalReason::ExplicitLandmarkMerge, context);
   }
 
   return success;
@@ -1936,6 +2010,8 @@ int ViSlamBackend::mergeLandmarks(std::vector<LandmarkId> fromIds, std::vector<L
 
   std::map<LandmarkId, LandmarkId> changes; // keep track of changes
   int ctr = 0;
+  const diagnostics::EventContext context =
+      realtimeGraph_.diagnosticsEventContext();
   for(size_t i = 0; i < fromIds.size(); ++i) {
     // check if the fromId hasn't already been changed
     while(changes.count(fromIds.at(i))) {
@@ -1951,10 +2027,14 @@ int ViSlamBackend::mergeLandmarks(std::vector<LandmarkId> fromIds, std::vector<L
     }
 
     // now merge
-    if(realtimeGraph_.mergeLandmark(fromIds.at(i), intoIds.at(i), multiFrames_)) {
+    if(realtimeGraph_.mergeLandmark(
+           fromIds.at(i), intoIds.at(i), multiFrames_,
+           diagnostics::RemovalReason::ExplicitLandmarkMerge, context)) {
       ctr++;
     }
-    fullGraph_.mergeLandmark(fromIds.at(i), intoIds.at(i), multiFrames_);
+    fullGraph_.mergeLandmark(
+        fromIds.at(i), intoIds.at(i), multiFrames_,
+        diagnostics::RemovalReason::ExplicitLandmarkMerge, context);
     changes[fromIds.at(i)] = intoIds.at(i);
 
     // also reset associated keypoints
@@ -2000,6 +2080,8 @@ void ViSlamBackend::optimiseFullGraph(int numIter, ::ceres::Solver::Summary &sum
 
   isLoopClosureAvailable_ = true;
   isLoopClosing_ = false;
+  diagnostics::VioDiagnostics::instance().writeLandmarkEvents(
+      fullGraph_.takeDiagnosticEvents());
 }
 
 void ViSlamBackend::doFinalBa(
@@ -2020,7 +2102,9 @@ void ViSlamBackend::doFinalBa(
       i++;
     }
   }
-  fullGraph_.cleanUnobservedLandmarks();
+  fullGraph_.cleanUnobservedLandmarks(
+      nullptr, diagnostics::RemovalReason::UnobservedLandmarkCleanup,
+      fullGraph_.diagnosticsEventContext());
   std::cout << "\rConstructing VI-BA problem... " << "100.00%" << std::endl;
 
   // unfreeze
@@ -2161,6 +2245,7 @@ void ViSlamBackend::doFinalBa(
 
   // get rid of unobserved landmarks
   cleanUnobservedLandmarks();
+  flushDiagnostics();
 }
 
 bool ViSlamBackend::saveMap(std::string path)

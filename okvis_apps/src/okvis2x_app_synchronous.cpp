@@ -33,6 +33,7 @@
 #include <okvis/ThreadedSlam.hpp>
 #include <okvis/TrajectoryOutput.hpp>
 #include <okvis/SubmappingInterface.hpp>
+#include <okvis/VioDiagnostics.hpp>
 
 
 int main(int argc, char **argv)
@@ -121,6 +122,26 @@ int main(int argc, char **argv)
   std::shared_ptr<okvis::ThreadedSlam> estimator(nullptr);
   estimator.reset(new okvis::ThreadedSlam(parameters, dBowVocDir, submapConfig));
   estimator->setBlocking(true);
+  okvis::diagnostics::VioDiagnostics& diagnosticsWriter =
+      okvis::diagnostics::VioDiagnostics::instance();
+  diagnosticsWriter.writeMetadata("executable", argv[0]);
+  diagnosticsWriter.writeMetadata(
+      "matching_threshold",
+      std::to_string(parameters.frontend.matching_threshold));
+  diagnosticsWriter.writeMetadata("gp3p_min_inliers", "10");
+  diagnosticsWriter.writeMetadata("gp3p_min_inlier_ratio", "0.7");
+  diagnosticsWriter.writeMetadata("triangulation_parallel_rule_version",
+                                  "okvis2x_20260807");
+  if (const char* runId = std::getenv("OKVIS_DIAGNOSTICS_RUN_ID")) {
+    diagnosticsWriter.writeMetadata("run_id", runId);
+  }
+  if (const char* buildId = std::getenv("OKVIS_DIAGNOSTICS_BUILD_ID")) {
+    diagnosticsWriter.writeMetadata("build_id", buildId);
+  }
+  if (const char* datasetId =
+          std::getenv("OKVIS_DIAGNOSTICS_DATASET_ID")) {
+    diagnosticsWriter.writeMetadata("dataset_id", datasetId);
+  }
 
   // Setup the submapping interface
   std::shared_ptr<okvis::SubmappingInterface> seInterface(nullptr);
@@ -325,5 +346,7 @@ int main(int argc, char **argv)
                     << std::flush;
       }
   }
+  estimator->flushDiagnostics();
+  diagnosticsWriter.finish(true);
   return EXIT_SUCCESS;
 }

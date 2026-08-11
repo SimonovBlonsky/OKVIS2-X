@@ -69,6 +69,9 @@ class ViGraphEstimator : public ViGraph
   /// \param stateId The state ID to perform the operation on.
   /// \return True on success.
   bool removeAllObservations(StateId stateId);
+  bool removeAllObservations(
+      StateId stateId, diagnostics::RemovalReason reason,
+      const diagnostics::EventContext& context);
 
   /// \brief Remove all observations and merge/append IMU errors.
   /// \param stateId The state ID to perform the operation on.
@@ -84,6 +87,11 @@ class ViGraphEstimator : public ViGraph
   /// \return True on success.
   bool mergeLandmark(LandmarkId fromId, LandmarkId intoId,
                      std::map<StateId,MultiFramePtr> &multiFrames);
+  bool mergeLandmark(
+      LandmarkId fromId, LandmarkId intoId,
+      std::map<StateId, MultiFramePtr>& multiFrames,
+      diagnostics::RemovalReason reason,
+      const diagnostics::EventContext& context);
 
   // freeze/unfreeze
   /// \brief Fixes poses from the first (ID 1) to stateId.
@@ -141,6 +149,14 @@ class ViGraphEstimator : public ViGraph
       std::vector<PoseGraphEdge>* createdPoseGraphEdges = nullptr,
       std::vector<std::pair<StateId, StateId> > *removedTwoPoseErrors = nullptr,
       std::vector<KeypointIdentifier> *removedObservations = nullptr);
+  bool convertToPoseGraphMst(
+      const std::set<StateId>& states,
+      const std::set<StateId>& statesToConsider,
+      std::vector<PoseGraphEdge>* createdPoseGraphEdges,
+      std::vector<std::pair<StateId, StateId>>* removedTwoPoseErrors,
+      std::vector<KeypointIdentifier>* removedObservations,
+      diagnostics::RemovalReason reason,
+      const diagnostics::EventContext& context);
 
   /// \brief Get the full Maximum Spanning Tree (MST) pose graph from all observations present.
   /// \note This will not change the underlying graph. \todo Rewrite to be made const.

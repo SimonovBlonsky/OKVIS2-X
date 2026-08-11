@@ -12,8 +12,10 @@ add_library(${LIB_NAME}
   include/okvis/ViFrontendInterface.hpp
   include/okvis/ViInterface.hpp
   include/okvis/ViParametersReader.hpp
+  include/okvis/VioDiagnostics.hpp
   src/ViInterface.cpp
   src/ViParametersReader.cpp
+  src/VioDiagnostics.cpp
 )
 target_include_directories(${LIB_NAME}
   PUBLIC
@@ -47,3 +49,21 @@ install(TARGETS ${LIB_NAME} EXPORT okvisTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY include/okvis DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
+
+if(BUILD_TESTS)
+  set(TEST_NAME okvis_common_test)
+  add_executable(${TEST_NAME}
+    test/TestVioDiagnostics.cpp
+    test/test_main.cpp
+  )
+  target_link_libraries(${TEST_NAME}
+    ${LIB_NAME}
+    ${GLOG_LIBRARIES}
+    gtest
+  )
+  target_compile_options(${TEST_NAME}
+    PUBLIC ${OKVIS_PUBLIC_CXX_FLAGS}
+    PRIVATE ${OKVIS_PRIVATE_CXX_FLAGS}
+  )
+  add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+endif()

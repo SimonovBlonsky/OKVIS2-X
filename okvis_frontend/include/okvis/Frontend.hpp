@@ -23,6 +23,7 @@
 #include <mutex>
 
 #include <okvis/Component.hpp>
+#include <okvis/FrontendDiagnostics.hpp>
 #include <okvis/ViFrontendInterface.hpp>
 #include <okvis/ViSlamBackend.hpp>
 #include <okvis/assert_macros.hpp>
@@ -261,6 +262,7 @@ private:
 
   bool isInitialized_;        ///< Is the pose initialised?
   const size_t numCameras_;   ///< Number of cameras in the configuration.
+  std::unique_ptr<diagnostics::FrontendDiagnosticFrames> diagnosticFrames_;
 
   /// @name BRISK detection parameters
   /// @{
@@ -383,7 +385,11 @@ private:
                     const okvis::cameras::NCameraSystem &nCameraSystem,
                     std::shared_ptr<okvis::MultiFrame> currentFrame,
                     bool initializePose,
-                    bool removeOutliers);
+                    bool removeOutliers,
+                    diagnostics::RansacTrigger primaryTrigger,
+                    uint32_t triggerMask,
+                    const kinematics::Transformation&
+                        dataAssociationStartPose);
   /**
    * @brief Remove outliers on current frame.
    * @warning As this function uses the estimator it is not threadsafe.
@@ -445,6 +451,7 @@ private:
     std::vector<KeypointIdentifier> kids; ///< All its observations.
     Eigen::Matrix3Xd e_W; ///< All directions in W-coords of the observations.
     Eigen::Matrix3Xd r_W; ///< Image centres of all the observations (W-coords).
+    Eigen::Matrix2Xd keypoints; ///< Observation pixels aligned with descriptors.
     bool is3d = false; ///< Determine whether treated as 3D initialised.
     Eigen::Vector2d projection; ///< 2D projection location in pixels.
     bool ignore = false; ///< Ignore if classified as sky / person.
@@ -482,7 +489,9 @@ private:
       const MapPoints& pointMap, size_t im, const MultiFramePtr&  multiFrame,
       std::vector<double>& distances, std::vector<LandmarkId>& lmIds,
       AlignedVector<Eigen::Vector4d>& hps_W, std::vector<size_t>& ctrs,
-      std::vector<double>& reprErrs) const;
+      std::vector<double>& reprErrs,
+      diagnostics::CameraMapMatchAccumulator* diagnosticAccumulator,
+      std::vector<double>* matchedReprojectionErrors) const;
 
   /**
    * @brief Parallelisable sub-part of matchToMap -- unitialised points.
@@ -514,7 +523,10 @@ private:
       size_t numKeypoints,
       const MapPoints& pointMap, size_t im, const MultiFramePtr&  multiFrame,
       std::vector<double>& distances, std::vector<LandmarkId>& lmIds,
-      AlignedVector<Eigen::Vector4d>& hps_W, std::vector<size_t>& ctrs) const;
+      AlignedVector<Eigen::Vector4d>& hps_W, std::vector<size_t>& ctrs,
+      diagnostics::CameraMapMatchAccumulator* diagnosticAccumulator,
+      diagnostics::TriangulationAccumulator*
+          triangulationDiagnosticAccumulator) const;
 
   std::atomic_bool trackingLost_; ///< Is the tracking currently lost?
 

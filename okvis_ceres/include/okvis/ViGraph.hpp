@@ -46,6 +46,7 @@
 #include <okvis/FrameTypedefs.hpp>
 #include <okvis/mapTypedefs.hpp>
 #include <okvis/Measurements.hpp>
+#include <okvis/VioDiagnostics.hpp>
 #include <okvis/ceres/PoseParameterBlock.hpp>
 #include <okvis/ceres/SpeedAndBiasParameterBlock.hpp>
 #include <okvis/ceres/HomogeneousPointParameterBlock.hpp>
@@ -96,6 +97,19 @@ class ViGraph
    * @brief The destructor (does nothing).
    */
   ~ViGraph() {}
+
+  void setDiagnosticsGraphRole(diagnostics::GraphRole role) {
+    diagnosticsGraphRole_ = role;
+  }
+  void setDiagnosticsCollectionEnabled(bool enabled);
+  diagnostics::EventContext diagnosticsEventContext() const;
+  void registerLandmarkBirth(LandmarkId landmarkId,
+                             const diagnostics::EventContext& context,
+                             bool emitEvent);
+  void recordObservationAdded(LandmarkId landmarkId,
+                              KeypointIdentifier keypointId,
+                              const diagnostics::EventContext& context);
+  std::vector<diagnostics::LandmarkEventRecord> takeDiagnosticEvents();
 
   /**
    * @brief Add a camera to the configuration. Sensors can only be added and never removed.
@@ -170,6 +184,9 @@ class ViGraph
    * @return True on successful removal.
    */
   bool removeLandmark(LandmarkId landmarkId);
+  bool removeLandmark(LandmarkId landmarkId,
+                      diagnostics::RemovalReason reason,
+                      const diagnostics::EventContext& context);
   /**
    * @brief Set landmark initialisation.
    * @param landmarkId The ID of the landmark to be set.
@@ -397,6 +414,9 @@ class ViGraph
    * @return True on success.
    */
   bool removeObservation(KeypointIdentifier keypointId);
+  bool removeObservation(KeypointIdentifier keypointId,
+                         diagnostics::RemovalReason reason,
+                         const diagnostics::EventContext& context);
 
   /// \brief Computes the co-visibilities of all observed frames.
   /// \return True on success.
@@ -718,6 +738,10 @@ class ViGraph
   /// \return The number of landmarks removed.
   int cleanUnobservedLandmarks(
       std::map<LandmarkId, std::set<KeypointIdentifier>> *removed = nullptr);
+  int cleanUnobservedLandmarks(
+      std::map<LandmarkId, std::set<KeypointIdentifier>>* removed,
+      diagnostics::RemovalReason reason,
+      const diagnostics::EventContext& context);
 
   /// \brief Update landmark quality and initialisation status using current graph/estimates.
   void updateLandmarks();
@@ -836,6 +860,27 @@ protected:
   std::map<StateId, State> states_; ///< Store all states.
   std::map<LandmarkId, Landmark> landmarks_; ///< Contains all current landmarks.
   std::map<KeypointIdentifier, Observation> observations_; ///< Contains all observations.
+
+  struct LandmarkBirthContext {
+    uint64_t timestampNs = 0;
+    uint64_t frameId = 0;
+  };
+  struct DiagnosticsState {
+    std::vector<diagnostics::LandmarkEventRecord> events;
+    std::map<LandmarkId, LandmarkBirthContext> births;
+  };
+  diagnostics::GraphRole diagnosticsGraphRole_ =
+      diagnostics::GraphRole::Realtime;
+  std::unique_ptr<DiagnosticsState> diagnostics_;
+
+  void enqueueLandmarkEvent(
+      LandmarkId landmarkId, diagnostics::LandmarkEventType eventType,
+      diagnostics::RemovalReason reason,
+      const diagnostics::EventContext& context,
+      std::optional<KeypointIdentifier> subject,
+      bool initialisedBefore, bool initialisedAfter,
+      size_t observationsBefore, size_t observationsAfter,
+      std::optional<double> quality);
 
   gpsStatus gpsStatus_ = gpsStatus::Off; /// < Indicator what status of GPS reception we are in
   bool gpsObservability_ = false; /// < Flag if T_GW is observable with so-far measurements; init with false since GPS extrinsics not observable before first measurements are added

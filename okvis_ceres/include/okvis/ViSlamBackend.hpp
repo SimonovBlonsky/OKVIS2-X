@@ -53,6 +53,9 @@ class ViSlamBackend //: public VioBackendInterface
     isLoopClosureAvailable_ = false;
     components_.resize(1);
     gpsObservability_ = false;
+    realtimeGraph_.setDiagnosticsGraphRole(
+        diagnostics::GraphRole::Realtime);
+    fullGraph_.setDiagnosticsGraphRole(diagnostics::GraphRole::Full);
   }
 
   /**
@@ -181,6 +184,15 @@ class ViSlamBackend //: public VioBackendInterface
     } else {
       fullGraph_.addObservation<GEOMETRY_TYPE>(*multiFrame, landmarkId, kid, useCauchy);
     }
+    if (success &&
+        diagnostics::VioDiagnostics::instance().observationAddsEnabled()) {
+      const diagnostics::EventContext context =
+          realtimeGraph_.diagnosticsEventContext();
+      realtimeGraph_.recordObservationAdded(landmarkId, kid, context);
+      if (!isLoopClosing_ && !isLoopClosureAvailable_) {
+        fullGraph_.recordObservationAdded(landmarkId, kid, context);
+      }
+    }
     return success;
   }
   /**
@@ -191,7 +203,15 @@ class ViSlamBackend //: public VioBackendInterface
    * @return True if observation was present and successfully removed.
    */
   bool removeObservation(StateId stateId,  size_t camIdx,
-                         size_t keypointIdx);
+                         size_t keypointIdx,
+                         diagnostics::RemovalReason reason =
+                             diagnostics::RemovalReason::Unknown);
+
+  std::vector<diagnostics::LandmarkEventRecord>
+  takeLandmarkDiagnosticEvents(diagnostics::GraphRole role);
+
+  /// Flush pending realtime and full-graph landmark diagnostics to the writer.
+  void flushDiagnostics();
 
   /// \brief Set the information of an observation.
   /// @param stateId ID of state where the landmark was observed.
