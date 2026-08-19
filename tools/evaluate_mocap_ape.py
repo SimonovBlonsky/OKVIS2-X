@@ -3,6 +3,7 @@
 import argparse
 import csv
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -42,6 +43,13 @@ class Pose:
     timestamp: float
     position: tuple[float, float, float]
     quaternion: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class PlotMetrics:
+    gt_distance_m: float
+    ape_rmse_mm: float
+    error_percentage: float
 
 
 class EvaluationError(RuntimeError):
@@ -159,6 +167,182 @@ def write_tum(path: Path, poses: list[Pose]) -> None:
             output.write(" ".join(str(value) for value in values) + "\n")
 
 
+def compute_plot_metrics(reference_positions, estimate_positions) -> PlotMetrics:
+    try:
+        import numpy as np
+    except ImportError as error:
+        raise EvaluationError("plotting requires numpy") from error
+
+    reference = np.asarray(reference_positions, dtype=float)
+    estimate = np.asarray(estimate_positions, dtype=float)
+    if (
+        reference.ndim != 2
+        or reference.shape[1:] != (3,)
+        or estimate.shape != reference.shape
+        or len(reference) < 2
+        or not np.all(np.isfinite(reference))
+        or not np.all(np.isfinite(estimate))
+    ):
+        raise EvaluationError(
+            "aligned GT and SLAM positions must be matching finite Nx3 arrays"
+        )
+
+    gt_distance_m = float(
+        np.sum(np.linalg.norm(np.diff(reference, axis=0), axis=1))
+    )
+    if gt_distance_m <= 0.0:
+        raise EvaluationError("associated GT trajectory has zero movement distance")
+    ape_rmse_m = float(
+        np.sqrt(np.mean(np.sum((estimate - reference) ** 2, axis=1)))
+    )
+    return PlotMetrics(
+        gt_distance_m=gt_distance_m,
+        ape_rmse_mm=ape_rmse_m * 1000.0,
+        error_percentage=100.0 * ape_rmse_m / gt_distance_m,
+    )
+
+
+def format_metrics_annotation(metrics: PlotMetrics) -> str:
+    return (
+        f"总运动里程: {metrics.gt_distance_m:.3f} m\n"
+        f"APE RMSE: {metrics.ape_rmse_mm:.3f} mm\n"
+        f"误差百分比: {metrics.error_percentage:.4f}%"
+    )
+
+
+def align_associated_positions(
+    reference: list[Pose], estimate: list[Pose], max_diff: float
+):
+    try:
+        import numpy as np
+        from evo.core import sync
+        from evo.core.trajectory import PoseTrajectory3D
+    except ImportError as error:
+        raise EvaluationError(
+            "plotting requires evo and numpy; run in the okvis2x conda environment"
+        ) from error
+
+    def to_evo(poses: list[Pose]) -> PoseTrajectory3D:
+        return PoseTrajectory3D(
+            positions_xyz=np.asarray([pose.position for pose in poses], dtype=float),
+            orientations_quat_wxyz=np.asarray(
+                [
+                    (
+                        pose.quaternion[3],
+                        pose.quaternion[0],
+                        pose.quaternion[1],
+                        pose.quaternion[2],
+                    )
+                    for pose in poses
+                ],
+                dtype=float,
+            ),
+            timestamps=np.asarray([pose.timestamp for pose in poses], dtype=float),
+        )
+
+    reference_evo, estimate_evo = sync.associate_trajectories(
+        to_evo(reference),
+        to_evo(estimate),
+        max_diff=max_diff,
+        first_name="mocap",
+        snd_name="SLAM",
+    )
+    estimate_evo.align(reference_evo, correct_scale=False)
+    return (
+        reference_evo.positions_xyz.copy(),
+        estimate_evo.positions_xyz.copy(),
+    )
+
+
+def save_trajectory_plot(
+    output: Path, reference_positions, estimate_positions, metrics: PlotMetrics
+) -> None:
+    cache_root = Path(tempfile.gettempdir()) / "okvis2x-plot-cache"
+    matplotlib_cache = cache_root / "matplotlib"
+    font_cache = cache_root / "fontconfig"
+    matplotlib_cache.mkdir(parents=True, exist_ok=True)
+    font_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(font_cache))
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.font_manager as font_manager
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as error:
+        raise EvaluationError("plotting requires matplotlib and numpy") from error
+
+    output = Path(output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    reference = np.asarray(reference_positions, dtype=float)
+    estimate = np.asarray(estimate_positions, dtype=float)
+
+    font_name = "DejaVu Sans"
+    for candidate in (
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "WenQuanYi Micro Hei",
+        "SimHei",
+        "Microsoft YaHei",
+        "Arial Unicode MS",
+    ):
+        try:
+            font_path = font_manager.findfont(candidate, fallback_to_default=False)
+        except ValueError:
+            continue
+        font_name = font_manager.FontProperties(fname=font_path).get_name()
+        break
+
+    with plt.rc_context(
+        {"font.family": "sans-serif", "font.sans-serif": [font_name],
+         "axes.unicode_minus": False}
+    ):
+        figure = plt.figure(figsize=(9.0, 8.0), constrained_layout=True)
+        grid = figure.add_gridspec(2, 1, height_ratios=(0.20, 0.80))
+        annotation_axis = figure.add_subplot(grid[0])
+        trajectory_axis = figure.add_subplot(grid[1])
+
+        annotation_axis.axis("off")
+        annotation_axis.set_title("Mocap GT 与 SLAM 估计轨迹", fontsize=16)
+        annotation_axis.text(
+            0.0,
+            0.48,
+            format_metrics_annotation(metrics),
+            ha="left",
+            va="center",
+            fontsize=11,
+            linespacing=1.5,
+        )
+
+        trajectory_axis.plot(
+            reference[:, 0], reference[:, 1],
+            color="#202124", linewidth=2.2, label="GT mocap 轨迹",
+        )
+        trajectory_axis.plot(
+            estimate[:, 0], estimate[:, 1],
+            color="#D1495B", linewidth=1.6, label="SLAM 估计轨迹",
+        )
+        trajectory_axis.scatter(
+            reference[0, 0], reference[0, 1],
+            marker="o", s=42, color="#2A9D8F", label="起点", zorder=4,
+        )
+        trajectory_axis.scatter(
+            reference[-1, 0], reference[-1, 1],
+            marker="s", s=42, color="#E9C46A", edgecolor="#202124",
+            linewidth=0.6, label="终点", zorder=4,
+        )
+        trajectory_axis.set_xlabel("X (m)")
+        trajectory_axis.set_ylabel("Y (m)")
+        trajectory_axis.set_aspect("equal", adjustable="datalim")
+        trajectory_axis.grid(True, color="#DADCE0", linewidth=0.8, alpha=0.8)
+        trajectory_axis.legend(loc="best", frameon=False)
+
+        figure.savefig(output, dpi=180, format="png")
+        plt.close(figure)
+
+
 def resolve_estimate(value: Path) -> Path:
     value = value.expanduser()
     if value.is_file():
@@ -260,6 +444,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="save evo results to this ZIP file",
     )
+    parser.add_argument(
+        "--plot",
+        type=Path,
+        help=(
+            "save an XY trajectory PNG with aligned mocap GT, SLAM estimate, "
+            "GT distance, APE RMSE and normalized error percentage"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -283,9 +475,25 @@ def evaluate(args: argparse.Namespace) -> int:
         estimate_tum = directory / "okvis.tum"
         write_tum(reference_tum, reference)
         write_tum(estimate_tum, estimate)
-        return run_evo(
+        return_code = run_evo(
             reference_tum, estimate_tum, args.max_diff, args.save_results
         )
+        if return_code != 0 or args.plot is None:
+            return return_code
+
+        reference_positions, estimate_positions = align_associated_positions(
+            reference, estimate, args.max_diff
+        )
+        metrics = compute_plot_metrics(reference_positions, estimate_positions)
+        plot_path = args.plot.expanduser()
+        save_trajectory_plot(
+            plot_path, reference_positions, estimate_positions, metrics
+        )
+        print(f"GT distance: {metrics.gt_distance_m:.3f} m")
+        print(f"APE RMSE: {metrics.ape_rmse_mm:.3f} mm")
+        print(f"Error percentage: {metrics.error_percentage:.4f}%")
+        print(f"Trajectory plot: {plot_path}")
+        return 0
 
     if args.tum_dir is not None:
         tum_dir = args.tum_dir.expanduser()

@@ -276,6 +276,52 @@ You find examples for the datasets used in the paper in the respective subfolder
   The result directory can be specified via the command line when running the application.
 </details>
 
+### Trajectory Evaluation
+
+VISLAM and a real final full bundle adjustment require both estimator options:
+
+```yaml
+estimator_parameters:
+  do_loop_closures: 1
+  do_final_ba: 1
+```
+
+For the EGO2 sequence, set the local workspace and dataset paths first, then
+save these settings in `${EGO2_ROOT}/okvis2_eucm_vislam.yaml`:
+
+```bash
+OKVIS_WS=/path/to/okvis_ws
+EGO2_ROOT=/path/to/EGO2
+SEQUENCE=20260727-163811
+RESULT_ROOT="${EGO2_ROOT}/${SEQUENCE}_result"
+mkdir -p "${RESULT_ROOT}"
+"${OKVIS_WS}/build/okvis/okvis_app_synchronous" \
+  "${EGO2_ROOT}/okvis2_eucm_vislam.yaml" \
+  "${EGO2_ROOT}/${SEQUENCE}_euroc" \
+  "${RESULT_ROOT}"
+```
+
+Loop closures select the `slam` prefix. With online extrinsic calibration, the
+result is `okvis2-slam-calib-final-ba_trajectory.csv`; otherwise it is
+`okvis2-slam-final-ba_trajectory.csv`.
+
+Install evo and compare the final-BA estimate with the OptiTrack log:
+
+```bash
+conda run -n okvis2x python -m pip install evo
+conda run -n okvis2x python tools/evaluate_mocap_ape.py \
+  "${EGO2_ROOT}/${SEQUENCE}/mocap.log" \
+  "${RESULT_ROOT}" \
+  --save-results "${RESULT_ROOT}/ape_se3.zip" \
+  --plot "${RESULT_ROOT}/trajectory_xy.png"
+```
+
+The evaluator reports evo's APE RMSE using rigid SE(3) alignment (`--align`).
+It does not apply scale correction. With `--plot`, it also writes an XY
+trajectory plot annotated with GT distance, APE RMSE, and normalized error.
+The default timestamp association tolerance is 10 ms; override it with
+`--max-diff SECONDS` when justified.
+
 ### Dataset Format ###
 <details>
   <summary>Click to expand</summary>
