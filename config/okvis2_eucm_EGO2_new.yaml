@@ -1,0 +1,138 @@
+%YAML:1.2
+# OKVis2 配置文件（由 gen_okvis2_config_eucm.py 自动生成）
+# 相机模型：EUCM（Extended Unified Camera Model，Kalibr 直出）
+# 外参约定：T_SC = inv(T_cam_imu)
+# 图像缩放：×0.5
+# 注意：布尔值使用 0/1（OpenCV YAML 解析器不支持 true/false）
+
+cameras:
+  # cam0 (front)  EUCM: alpha=0.6584683191  beta=1.0819725746
+  - {T_SC:
+       [0.2775557418, 0.7659734602, -0.5798684923, -0.1469373779,
+        0.1538309701, 0.5603613764, 0.8138373059, 0.0824206427,
+        0.9483136838, -0.3150869499, 0.0377010771, -0.0399598492,
+        0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000],
+     image_dimension: [960, 600],
+     distortion_coefficients: [0.0, 0.0, 0.0, 0.0],
+     distortion_type: none,
+     focal_length: [311.43585754, 311.16949730],
+     principal_point: [477.38275882, 301.50343701],
+     eucm_parameters: [0.6584683191, 1.0819725746],
+     cam_model: eucm,
+     camera_type: grayscale,
+     mapping_rectification: 1,
+     slam_use: okvis}
+
+  # cam1 (right)  EUCM: alpha=0.6616854299  beta=1.0826399855
+  - {T_SC:
+       [0.9995813535, 0.0214099173, 0.0194610682, -0.0574669876,
+        -0.0288645782, 0.7841507721, 0.6198987037, 0.0762257754,
+        -0.0019884317, -0.6202009208, 0.7844404783, 0.0169028775,
+        0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000],
+     image_dimension: [960, 600],
+     distortion_coefficients: [0.0, 0.0, 0.0, 0.0],
+     distortion_type: none,
+     focal_length: [311.24895763, 311.29750431],
+     principal_point: [480.17738031, 298.77678024],
+     eucm_parameters: [0.6616854299, 1.0826399855],
+     cam_model: eucm,
+     camera_type: grayscale,
+     slam_use: okvis}
+
+  # cam2 (back-left)  EUCM: alpha=0.6621421099  beta=1.0794878922
+  - {T_SC:
+       [0.9999030102, 0.0109445581, 0.0086131787, 0.0063668436,
+        -0.0139273015, 0.7847917966, 0.6196029908, 0.0747407883,
+        0.0000217289, -0.6196628540, 0.7848681080, 0.0166127541,
+        0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000],
+     image_dimension: [960, 600],
+     distortion_coefficients: [0.0, 0.0, 0.0, 0.0],
+     distortion_type: none,
+     focal_length: [310.87856371, 310.94656516],
+     principal_point: [476.24868718, 299.85730937],
+     eucm_parameters: [0.6621421099, 1.0794878922],
+     cam_model: eucm,
+     camera_type: grayscale,
+     slam_use: okvis}
+
+  # cam3 (back-right)  EUCM: alpha=0.6602074175  beta=1.0836732364
+  - {T_SC:
+       [0.2556836149, -0.7529025803, 0.6064351520, 0.0949869567,
+        -0.1781227355, 0.5798587278, 0.7950070106, 0.0774976471,
+        -0.9502095454, -0.3112901545, 0.0141513084, -0.0417493949,
+        0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000],
+     image_dimension: [960, 600],
+     distortion_coefficients: [0.0, 0.0, 0.0, 0.0],
+     distortion_type: none,
+     focal_length: [311.21975114, 310.87696913],
+     principal_point: [484.41417368, 297.51630562],
+     eucm_parameters: [0.6602074175, 1.0836732364],
+     cam_model: eucm,
+     camera_type: grayscale,
+     slam_use: okvis}
+
+camera_parameters:
+  timestamp_tolerance: 0.075
+  sync_cameras: [0, 1, 2, 3]
+  image_delay: 0.008987620
+  online_calibration:
+    do_extrinsics: 1
+    do_extrinsics_final_ba: 1
+    sigma_r: 0.001
+    sigma_alpha: 0.005
+    sigma_r_final_ba: 0.003
+    sigma_alpha_final_ba: 0.016
+  fov_scale: 0.9
+
+imu_parameters:
+  use: 1
+  a_max: 176.0
+  g_max: 7.8
+  sigma_g_c:  1.5775e-03   # gyroscope_noise_density
+  sigma_a_c:  1.7457e-02   # accelerometer_noise_density
+  sigma_bg: 0.01
+  sigma_ba: 0.1
+  sigma_gw_c: 9.6263e-05   # gyroscope_random_walk
+  sigma_aw_c: 8.8198e-04   # accelerometer_random_walk
+  g: 9.81007
+  g0: [0.0, 0.0, 0.0]
+  a0: [0.0, 0.0, 0.0]
+  s_a: [1.0, 1.0, 1.0]
+  T_BS:
+    [1.0000000000, 0.0000000000, 0.0000000000, 0.0000000000,
+     0.0000000000, 1.0000000000, 0.0000000000, 0.0000000000,
+     0.0000000000, 0.0000000000, 1.0000000000, 0.0000000000,
+     0.0000000000, 0.0000000000, 0.0000000000, 1.0000000000]
+
+frontend_parameters:
+  detection_threshold: 50.0
+  absolute_threshold: 20.0
+  matching_threshold: 60.0
+  octaves: 0
+  max_num_keypoints: 400
+  keyframe_overlap: 0.59
+  use_cnn: 0
+  parallelise_detection: 1
+  num_matching_threads: 8
+
+estimator_parameters:
+  num_keyframes: 5
+  num_loop_closure_frames: 5
+  num_imu_frames: 3
+  do_loop_closures: 1
+  do_final_ba: 1
+  enforce_realtime: 1
+  realtime_min_iterations: 3
+  realtime_max_iterations: 10
+  realtime_time_limit: 0.035
+  realtime_num_threads: 8
+  full_graph_iterations: 15
+  full_graph_num_threads: 4
+  p_dbow: 0.4
+  drift_percentage_heuristic: 1.35
+
+output_parameters:
+  display_topview: 1
+  display_matches: 1
+  display_overhead: 0
+  enable_submapping: 0
