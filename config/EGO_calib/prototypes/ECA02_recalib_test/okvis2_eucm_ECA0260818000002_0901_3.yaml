@@ -1,0 +1,113 @@
+%YAML:1.2
+cameras:
+  - T_SC: [0.25224834494049336, 0.766270004693479, -0.5909323585503143, -0.13094401746403683,
+      0.18452314232285946, 0.5613842783685455, 0.8067210806393528, 0.05652673580308894,
+      0.9499063019172361, -0.3125347531198458, 0.00021370596028584895, -0.05013044111160877,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [960, 600]
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
+    distortion_type: none
+    focal_length: [310.43787343443415, 310.29029900867505]
+    principal_point: [479.95932427583915, 301.01408439202396]
+    eucm_parameters: [0.6618717841355563, 1.0781352390714476]
+    cam_model: eucm
+    camera_type: grayscale
+    mapping_rectification: 1
+    slam_use: okvis
+  - T_SC: [0.9999844227880964, -0.0054542300264510514, 0.0011855614591724164, -0.04298301846741874,
+      0.0035622534784995018, 0.787163981632126, 0.6167334727183296, 0.05260707939255642,
+      -0.004297037503889515, -0.6167196424599058, 0.7871711491618665, 0.008685203689615615,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [960, 600]
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
+    distortion_type: none
+    focal_length: [311.48500145476123, 311.5329958956295]
+    principal_point: [482.604251786861, 298.30384070236954]
+    eucm_parameters: [0.6618950456161286, 1.0781663485525876]
+    cam_model: eucm
+    camera_type: grayscale
+    slam_use: okvis
+  - T_SC: [0.999838856321323, 0.011118608993164546, 0.014093896697790374, 0.022396990606283432,
+      -0.01742455192198763, 0.7899334652325396, 0.612944944914331, 0.05260027293127027,
+      -0.0043181454802757755, -0.6130917525458744, 0.7899999092277429, 0.008547078790737808,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [960, 600]
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
+    distortion_type: none
+    focal_length: [309.5488478609435, 309.62049088838035]
+    principal_point: [484.8095150882667, 301.1718546176959]
+    eucm_parameters: [0.6611557030604431, 1.0792618425899572]
+    cam_model: eucm
+    camera_type: grayscale
+    slam_use: okvis
+  - T_SC: [0.2627211605817184, -0.7641184503751317, 0.589152429833663, 0.10997586401963833,
+      -0.18761974165866468, 0.5584896867968363, 0.8080149146405128, 0.056666552962210175,
+      -0.946454660468497, -0.322819242824659, 0.0033633524321836734, -0.050119718181798445,
+      0.0, 0.0, 0.0, 1.0]
+    image_dimension: [960, 600]
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
+    distortion_type: none
+    focal_length: [310.7018608349589, 310.6313032496931]
+    principal_point: [485.86265171514236, 302.1139371169383]
+    eucm_parameters: [0.6607320783070126, 1.077361993413589]
+    cam_model: eucm
+    camera_type: grayscale
+    slam_use: okvis
+camera_parameters:
+  timestamp_tolerance: 0.075
+  sync_cameras: [0, 1, 2, 3]
+  image_delay: -0.00010280706572902646
+  online_calibration:
+    do_extrinsics: 1
+    do_extrinsics_final_ba: 1
+    sigma_r: 0.001
+    sigma_alpha: 0.005
+    sigma_r_final_ba: 0.003
+    sigma_alpha_final_ba: 0.016
+  fov_scale: 0.9
+imu_parameters:
+  use: 1
+  a_max: 176.0
+  g_max: 7.8
+  sigma_g_c: 0.001417888632503391
+  sigma_a_c: 0.01895289706113393
+  sigma_bg: 0.01
+  sigma_ba: 0.1
+  sigma_gw_c: 6.921867416068522e-05
+  sigma_aw_c: 0.000818747487212596
+  g: 9.81007
+  g0: [0.0, 0.0, 0.0]
+  a0: [0.0, 0.0, 0.0]
+  s_a: [1.0, 1.0, 1.0]
+  T_BS: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+    1.0]
+frontend_parameters:
+  detection_threshold: 50.0
+  absolute_threshold: 20.0
+  matching_threshold: 60.0
+  octaves: 0
+  max_num_keypoints: 400
+  keyframe_overlap: 0.59
+  use_cnn: 0
+  parallelise_detection: 1
+  num_matching_threads: 8
+estimator_parameters:
+  num_keyframes: 5
+  num_loop_closure_frames: 5
+  num_imu_frames: 3
+  do_loop_closures: 1
+  do_final_ba: 1
+  enforce_realtime: 1
+  realtime_min_iterations: 3
+  realtime_max_iterations: 10
+  realtime_time_limit: 0.035
+  realtime_num_threads: 8
+  full_graph_iterations: 15
+  full_graph_num_threads: 4
+  p_dbow: 0.4
+  drift_percentage_heuristic: 1.35
+output_parameters:
+  display_topview: 1
+  display_matches: 1
+  display_overhead: 0
+  enable_submapping: 0
